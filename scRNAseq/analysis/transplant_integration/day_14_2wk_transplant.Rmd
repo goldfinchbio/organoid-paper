@@ -1,0 +1,1372 @@
+---
+title: "Day 14 - 2 wk transplant integration"
+output:
+  html_document:
+    code_folding: hide
+    collapsed: no
+    highlight: haddock
+    keep_md: no
+    theme: cerulean
+    toc: yes
+    toc_float:
+      collapsed: yes
+    toc_depth: 6
+    number_sections: false
+params:
+    date: !r format(Sys.Date(), "%d %B, %Y")
+    client: Goldfinch Bio
+
+---
+
+<!-- Indent the TOC -->
+<script>
+$(document).ready(function() {
+  $items = $('div#TOC li');
+  $items.each(function(idx) {
+    num_ul = $(this).parentsUntil('#TOC').length;
+    $(this).css({'text-indent': num_ul * 10, 'padding-left': 0});
+  });
+
+});
+</script>
+
+<table width=100%>
+<tr>
+<td>
+<h3>Prepared for `r params$client` by:</h3>
+Diamond Age Data Science
+</td>
+<td width=150></td>
+<td width=150 align=right>`r params$date`</td>
+</tr>
+</table>
+
+
+
+
+```{r setup, include=FALSE}
+DOCNAME = "Day_14_2wk_transplant"
+knitr::opts_chunk$set(autodep        = TRUE,
+                      cache          = TRUE,
+                      cache.path     = paste0("cache/", DOCNAME, "/"),
+                      fig.path       = paste0("cache/", DOCNAME, "/"),
+                      cache.comments = FALSE,
+                      cache.lazy     = FALSE,
+                      echo           = TRUE,
+                      error          = FALSE,
+                      fig.align      = "center",
+                      fig.width      = 10,
+                      fig.height     = 8,
+                      message        = FALSE,
+                      warning        = FALSE)
+
+#Libraries
+library(Seurat)
+library(parallel)
+library(future)
+library(here)
+library(GSVA)
+library(clustree)
+library(viridis)
+library(knitr)
+library(DT)
+library(kableExtra)
+library(tidyverse)
+
+source(here("R/utilities.R"))
+
+#Options
+nCores <- 18
+options(future.globals.maxSize = 8 * 1024^3)
+save = TRUE
+
+
+
+# Functions
+
+
+
+# Directories
+baseDir = here()
+saveDir = file.path(baseDir,"output", DOCNAME)
+if(!dir.exists(saveDir)){
+  dir.create(saveDir)
+}
+
+
+
+```
+
+```{r load-sample-info}
+
+annotations <- read.csv(here("data/IGFB-001682_sample_annotations.csv"), header = TRUE, stringsAsFactors = FALSE)
+# get directories with seq data
+seq_dirs <- list.dirs(path = "/mnt/data/cellranger_align_transplant/", full.names = T, recursive = F)
+seq_dirs <- seq_dirs[!grepl("bash", seq_dirs)]
+# cellranger_dirs <- lapply(seq_dirs, function(x){list.dirs(paste0(x, "/cellranger"), recursive = F)})
+# cellranger_dirs <- unlist(cellranger_dirs)
+
+cellranger_dirs <- data.frame(directory = seq_dirs, stringsAsFactors = F)
+cellranger_dirs$GTC_ID <- stringr::str_split(cellranger_dirs$directory, pattern = "/", simplify = T)[,6]
+
+annotations <- left_join(annotations, cellranger_dirs, by = "GTC_ID")
+annotations <- annotations %>% filter(!is.na(directory))
+annotations$sample_name <- paste0(gsub(" ", "_", annotations$condition), "_rep",annotations$replicate)
+annotations$sample_name <- gsub("-_", "", annotations$sample_name)
+annotations <- annotations %>% filter(grepl("14_2wk", sample_name))
+```
+
+
+Introduction
+============
+
+In this analysis we will perform integration, clustering and cell type identification of the 3 **Day 14 - 2wk transplant** samples. 
+
+```{r sample-info}
+annotations %>% select(sample_name, everything()) %>% kable() %>% kable_styling()
+``` 
+
+
+```{r load_existing_seur, cache=FALSE}
+if(file.exists(file.path(saveDir, paste0(DOCNAME, ".RDS")))){
+  seur <- read_rds(file.path(saveDir, paste0(DOCNAME, ".RDS")))
+  do_eval <- FALSE
+  DefaultAssay(seur) <- "RNA"
+}else{
+  do_eval <- TRUE
+}
+
+```
+
+Set up Seurat object
+====================
+
+Load counts
+-----------
+
+```{r process-counts}
+
+counts <- mclapply(1:nrow(annotations), function(x){
+    counts <- Read10X(data.dir = paste0(annotations$directory[x], "/outs/filtered_feature_bc_matrix/"))
+    colnames(counts) <- paste0(colnames(counts), "-", annotations$sample_name[x])
+    return(counts)
+    }, mc.cores = nCores)
+
+counts <- do.call(cbind, counts)
+
+```
+
+### Identify human and rat cells
+
+#### Human vs rat transcripts
+
+```{r cell_species_plot}
+
+gene_species <- ifelse(str_detect(rownames(counts), "^rn6"), "rat", "human")
+rat_inds <- gene_species == "rat"
+human_inds <- gene_species == "human"
+
+cell_species <- tibble(cell_id = colnames(counts),
+                       orig.ident = str_split(cell_id, "-", simplify = T)[,2],
+                       n_rat_umi = Matrix::colSums(counts[rat_inds,]),
+                       n_human_umi = Matrix::colSums(counts[human_inds,]),
+                       tot_umi = Matrix::colSums(counts),
+                       prop_rat = n_rat_umi / tot_umi,
+                       prop_human = n_human_umi / tot_umi)
+
+cell_species <- cell_species %>% 
+  mutate(species = case_when(
+    prop_rat > 0.75 ~ "rat",
+    prop_human > 0.75 ~ "human",
+    TRUE ~ "mixed"
+  ))
+
+ggplot(cell_species, aes(n_human_umi, n_rat_umi, color = species)) +
+  geom_point(size = 0.5) +
+  facet_wrap(~orig.ident, ncol = 2)
+
+
+```
+
+#### Human and rat cell numbers
+
+```{r cell_species_table}
+# cell_species %>% 
+#   dplyr::count(species) %>% 
+#   mutate(proportion = n / ncol(counts)) %>% kable() %>% kable_styling(full_width = F, position = "left")
+
+cell_species %>% group_by(orig.ident, species) %>% summarise(count = n()) %>% 
+  mutate(percent = round(count/sum(count),3)*100) %>% 
+  select(orig.ident, species, count, percent) %>% arrange(orig.ident) -> cell_species_table
+
+cell_species_table %>% kable() %>% kable_styling(full_width = F, position = "left") 
+
+ggplot(cell_species_table, aes(x=orig.ident,y=count))+
+  geom_bar(aes(fill=species),position = "dodge", stat="identity") + 
+  xlab("")
+
+```
+
+
+Create Seurat Object
+--------------------
+
+```{r temp_seurat}
+
+metadata <- data.frame()
+for(n in annotations$sample_name){
+  num_cells <- sum(grepl(n,colnames(counts), fixed = T))
+  temp_meta <- data.frame(cell_name = colnames(counts)[grepl(n, colnames(counts), fixed = T)],
+                          sample_name = rep(n, num_cells))
+  temp_meta <- left_join(temp_meta, annotations, by = "sample_name")
+  temp_meta <- as.data.frame(temp_meta)
+  rownames(temp_meta) <- temp_meta$cell_name
+  temp_meta <- temp_meta[,-1]
+  metadata <- rbind(metadata, temp_meta)
+}
+
+metadata %>% rownames_to_column("cell_id") -> metadata
+join_meta <- full_join(metadata, cell_species %>% select(-orig.ident), by = "cell_id")
+
+meta <- data.frame(row.names = join_meta$cell_id)
+meta <- cbind(meta, join_meta)
+
+
+tempSeur <- CreateSeuratObject(counts,min.cells = 10,
+                                 names.field = 2,
+                                 names.delim = "-",
+                                 meta.data = meta)
+
+tempSeur_human <- subset(tempSeur, species == "human")
+tempSeur_human <- PercentageFeatureSet(tempSeur_human, pattern = "MT-", col.name = "percent.mito")
+tempSeur_human$replicate <- factor(tempSeur_human$replicate)
+
+# Matrix::rowSums(counts[which(grepl("MT-", rownames(counts))),])
+
+```
+
+## QC Plots 
+
+### UMI counts vs Number of Genes
+
+#### Human and Rat
+
+```{r tempSeur_scatter}
+# FeatureScatter(tempSeur, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", group.by = "species") + ggtitle("All Cells")
+
+ggplot(data = tempSeur@meta.data, aes(x=nCount_RNA, nFeature_RNA))+
+  geom_jitter(aes(color = species), size=0.5)+
+  facet_wrap(~orig.ident)
+
+```
+
+#### Human Cells
+
+```{r tempSeur_scatter_human}
+
+ggplot(data = tempSeur_human@meta.data, aes(x=nCount_RNA, y=nFeature_RNA))+
+  geom_jitter(aes(color=species), size=0.5) +
+  facet_wrap(~orig.ident)
+
+```
+
+### UMI counts vs Percent Mito
+Most of the cells with a high percentage of mitochondrial transcripts have a low number of UMIs
+
+```{r tempSeur_scatter_mito}
+
+ggplot(data = tempSeur_human@meta.data, aes(x=nCount_RNA, y=percent.mito))+
+  geom_jitter(aes(color=species), size=0.5) +
+  facet_wrap(~orig.ident)
+
+```
+
+
+### Violin Plots
+QC violin plots grouped by replicate
+
+```{r qc_violin, fig.height=4}
+VlnPlot(tempSeur_human, features = c("nFeature_RNA", "nCount_RNA", "percent.mito"), pt.size = 0, group.by = "replicate")
+
+```
+
+### QC Box Plots
+
+```{r}
+melt <- reshape2::melt(tempSeur_human@meta.data %>% select(nFeature_RNA, nCount_RNA, percent.mito, orig.ident, replicate), id.vars=c("orig.ident", "replicate"))
+melt$replicate <- factor(melt$replicate)
+
+ggplot(data = melt, aes(x=replicate, y=value, fill=replicate))+
+  geom_boxplot() +
+  facet_wrap(~variable, scales = "free") +
+  theme(legend.position = "none")
+
+```
+
+
+
+## Filter Cells
+
+
+```{r filter_cells}
+
+tempSeur_human_filter <- subset(tempSeur_human, nFeature_RNA > 100 & nCount_RNA > 100 & nCount_RNA < 15000 & percent.mito < 20)
+
+```
+
+### Post-QC Violin Plots
+
+```{r post_qc_vln}
+
+VlnPlot(tempSeur_human_filter, features = c("nFeature_RNA", "nCount_RNA", "percent.mito"), pt.size = 0, group.by = "replicate")
+
+
+
+```
+
+### Post-QC Box Plots
+
+```{r post_qc_box}
+
+tempSeur_human_filter$replicate <- factor(tempSeur_human_filter$replicate)
+
+seur_box_plot(object = tempSeur_human_filter,
+              features = c("nFeature_RNA", "nCount_RNA", "percent.mito"),
+              group = "replicate")
+
+
+```
+
+### Cell Numbers
+
+This graph shows the number of human cells in each replicate after filtering
+
+```{r post_qc_numb, fig.height=4, fig.width=4}
+
+plotDF <- tempSeur_human_filter@meta.data
+# plotDF %>% group_by(replicate) %>% summarize(count = n())
+
+ggplot(data = plotDF, aes(x=replicate, fill= replicate))+
+  geom_bar() +
+  theme(legend.position = "none")
+
+```
+
+
+Create Filtered Seurat Object
+=============================
+
+
+```{r filtered_seur, results="hide", cache=FALSE, eval=do_eval}
+## create new seurat object without rat cells or genes
+counts_human_filter <- counts[,colnames(tempSeur_human_filter)]
+counts_human_filter <- counts_human_filter[!grepl("rn6", rownames(counts_human_filter)),]
+rownames(counts_human_filter) <- gsub("GRCh38_", "", rownames(counts_human_filter))
+
+meta <- meta %>% filter(cell_id %in% colnames(counts_human_filter))
+
+seur <- CreateSeuratObject(counts_human_filter,min.cells = 10,
+                                 names.field = 2,
+                                 names.delim = "-",
+                                 meta.data = meta)
+
+seur <- PercentageFeatureSet(seur, pattern = "^MT-", col.name = "percent.mito")
+
+
+rm(seur_human, seur_human_filter, counts, counts_human_filter, join_meta, metadata, temp_meta)
+gc()
+
+
+
+```
+
+
+```{r, eval=do_eval}
+
+seur <- NormalizeData(seur, verbose = FALSE)
+seur <- FindVariableFeatures(seur, selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+
+seur <- CellCycleScoring(seur, s.features = cc.genes$s.genes, g2m.features = cc.genes$g2m.genes)
+seur <- ScaleData(seur, vars.to.regress = c("orig.ident", "nCount_RNA", "percent.mito", "S.Score", "G2M.Score"),
+                      verbose = TRUE)
+
+seur <- PercentageFeatureSet(seur, pattern = "RP", col.name = "percent.ribo")
+
+seur <- RunPCA(seur, npcs = 50, verbose = F)
+seur <- RunUMAP(seur, dims = 1:50)
+
+seur <- FindNeighbors(seur, reduction = "pca", dims = 1:50)
+seur <- FindClusters(seur, resolution = 0.5)
+
+
+# seur <- RunTSNE(object = seur, dims = 1:50)
+
+
+
+```
+
+
+# Remove cells with high ribosomal transcript numbers
+
+The high ribosomal population is in Cluster 0
+
+```{r filter-ribo}
+DimPlot(seur, group.by = "RNA_snn_res.0.5", label = T)
+
+
+```
+
+```{r, filter-ribo2, fig.height=15}
+FeaturePlot(seur, features = c("percent.ribo", "nFeature_RNA", "PECAM1"), min.cutoff = "q9", ncol = 1)
+```
+
+
+```{r filter-ribo3, eval=do_eval}
+seur <- subset(seur, RNA_snn_res.0.5 != 0)
+
+seur <- RunPCA(seur, npcs = 50, verbose = F)
+seur <- RunUMAP(seur, dims = 1:50)
+seur <- RunTSNE(seur, dims = 1:50)
+
+```
+
+## Cell Numbers
+
+```{r post_qc_numb2, fig.height=6, fig.width=4}
+
+plotDF <- seur@meta.data
+# plotDF %>% group_by(replicate) %>% summarize(count = n())
+
+ggplot(data = plotDF, aes(x=orig.ident, fill= orig.ident))+
+  geom_bar() +
+  theme(legend.position = "none") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+cell_num <- plotDF %>% group_by(orig.ident) %>% summarise(count = n())
+cell_num %>% kable() %>% kable_styling()
+
+
+num <- sum(cell_num$count)
+```
+
+After filtering there are **`r num`** total cells
+
+
+### By Replicate
+
+```{r}
+
+plotDF %>% group_by(orig.ident) %>% summarise(count = n()) %>% write_csv(paste0("../cell_numbers/", DOCNAME, ".csv"))
+
+```
+
+
+
+
+Dimensional reduction
+=====================
+
+PCA
+---
+
+
+```{r plot-pca}
+DimPlot(seur, 
+        reduction = "pca", 
+        group.by = "orig.ident")
+
+```
+
+
+
+```{r pca-feature}
+FeaturePlot(seur, 
+            features = c("nCount_RNA", "nFeature_RNA", "percent.mito"), 
+            ncol = 2, 
+            min.cutoff = "q9", 
+            reduction = "pca")
+```
+
+
+### Elbow Plot
+I chose to use 50 PCs for dimensional reduction
+
+```{r elbow, fig.height=4,fig.width=6}
+ElbowPlot(seur, ndims = 50)
+```
+
+
+
+
+UMAP
+----
+
+
+
+```{r plot-umap}
+DimPlot(seur, 
+        reduction = "umap", 
+        group.by = "orig.ident")
+
+
+```
+
+
+
+
+```{r qc-feature-umap}
+
+FeaturePlot(seur, features = c("nCount_RNA", "nFeature_RNA", "percent.mito"), ncol = 2, min.cutoff = "q9")
+
+```
+
+
+tSNE
+----
+
+
+
+```{r plot-tsne}
+DimPlot(seur, 
+        reduction = "tsne", 
+        group.by = "orig.ident")
+```
+
+
+```{r qc-feature-tsne}
+
+FeaturePlot(seur, features = c("nCount_RNA", "nFeature_RNA", "percent.mito"), ncol = 2, min.cutoff = "q9", reduction = "tsne")
+
+```
+
+Cell Cycle
+----------
+
+```{r cc_umap}
+
+# seur <- CellCycleScoring(seur, s.features = cc.genes$s.genes, g2m.features = cc.genes$g2m.genes, assay = "RNA")
+
+DimPlot(seur, reduction = "umap",
+        group.by = "Phase")
+
+```
+
+
+
+
+
+
+Clustering
+==========
+
+
+```{r clusters, results="hide", eval=do_eval}
+
+seur <- FindNeighbors(seur, reduction = "pca", dims = 1:50)
+
+res = seq(0,1,0.1)
+
+seur <- FindClusters(seur, resolution = res)
+
+saveDat(seur, filename = DOCNAME)
+
+```
+
+We will use Seurat to find clusters at a series of resolutions and then choose the resolution that best fits our data. 
+
+
+## UMAP plots {.tabset}
+
+Here are UMAP plots of the different resolutions.
+
+```{r cluster-umap, results = "hide"}
+res = seq(0,1,0.1)
+src_list <- lapply(res, function(res) {
+    src <- c("### Res {{res}} {.unnumbered}",
+             "```{r cluster-umap-{{res}}}",
+             "DimPlot(seur, reduction = 'umap' ,group.by = 'RNA_snn_res.{{res}}', label=T) + NoLegend()",  
+             "```",
+             "")
+    knit_expand(text = src)
+})
+
+out <- knit_child(text = unlist(src_list), options = list(cache = FALSE))
+```
+
+`r out`
+
+
+
+
+## Cluster analysis
+
+Now we will at the cluster tree for these resolutions to get a sense for which resolution best represents the complexity of the data
+
+### Clustree by resolution
+
+```{r clustree-assay, cache=FALSE}
+DefaultAssay(seur) <- "RNA"
+```
+
+
+```{r clustree, fig.width=12, fig.height=10}
+
+clustree(seur)
+```
+
+
+### Clustree cluster stability
+
+Here we plot the cluster stability metric from the SC3 package.
+
+```{r clust_stability, fig.width=12, fig.height=10, cache=FALSE}
+clustree(seur, node_colour = "sc3_stability")
+```
+
+### Gene expression {.tabset}
+
+Coloured by the expression of some well-known kidney marker genes.
+
+```{r select-clustree-genes}
+# genes <- c("PECAM1", "CDH5", "MEIS1", "PDGFRA", "HMGB2", "CENPA", "SIX1",
+#            "DAPL1", "NPHS1", "PODXL", "S100A8", "TYROBP", "MAL", "EMX2",
+#            "LRP2", "GATA3", "SLC12A1", "SPINT2", "TUBB2B", "STMN2", "TTYH1",
+#            "HBA1", "HBG1")
+
+
+feature_markers <- readxl::read_excel(here("data/feature_plot_markers.xlsx"))
+feature_markers <- feature_markers %>% filter(Gene %in% rownames(seur@assays$RNA@scale.data))
+
+genes <- feature_markers$Gene[-which(duplicated(feature_markers$Name))]
+genes <- unique(genes)
+is_present <- genes %in% rownames(seur)
+```
+
+
+```{r clustree-genes, results = "hide"}
+src_list <- lapply(genes[is_present], function(gene) {
+    src <- c("#### {{gene}} {.unnumbered}",
+             "```{r clustree-{{gene}}}",
+             "clustree(seur, node_colour = '{{gene}}',",
+                      "node_colour_aggr = 'mean',",
+             "exprs = 'scale.data') +",
+             "scale_colour_viridis_c(option = 'plasma', begin = 0.3)",
+             "```",
+             "")
+    knit_expand(text = src)
+})
+
+out <- knit_child(text = unlist(src_list), options = list(cache = FALSE))
+```
+
+`r out`
+
+## Marker Gene Feature Plots {.tabset}
+```{r feature-assay, cache=FALSE}
+DefaultAssay(seur) <- "RNA"
+```
+
+```{r feature_markers}
+
+feature_markers_list <- lapply(unique(feature_markers$Name), function(x){
+  features <- feature_markers %>% filter(Name == x)
+})
+
+names(feature_markers_list) <- unique(feature_markers$Name)
+
+```
+
+```{r feature-plots, results = "hide"}
+src_list <- lapply(names(feature_markers_list), function(celltype) {
+    src <- c("### {{celltype}} {.unnumbered}",
+             "```{r features-{{celltype}}}",
+             "FeaturePlot(seur, reduction = 'umap',",
+                  "features = feature_markers_list[['{{celltype}}']]$Gene)",
+             "```",
+             "")
+    knit_expand(text = src)
+})
+
+out <- knit_child(text = unlist(src_list), options = list(cache = FALSE,fig.height=6))
+
+```
+
+`r out`
+
+
+
+## Select resolution
+
+```{r set-res, cache=FALSE}
+
+set_res <- 0.7
+
+
+```
+
+```{r set-res2, cache=FALSE}
+Idents(seur) <- paste0("RNA_snn_res.",set_res)
+```
+
+
+Analyze clusters
+================
+
+UMAP of Clusters
+----------------
+
+This UMAP plot shows the clusters for the resolution that we chose: **`r set_res`**
+
+```{r tsne-chosen-clusters}
+
+
+DimPlot(seur,
+        reduction = "umap",
+        group.by = paste0("RNA_snn_res.",set_res),
+        label = T) + NoLegend() +ggtitle(paste0("Resolution ", set_res))
+
+
+```
+
+
+
+Find markers for each cluster
+-----------------------------
+Now we will determine which genes are differentially expressed in each cluster relative to the cells in all other clusters. These marker genes will aid us in cell type classification of the clusters.
+
+
+### Marker genes
+
+This table shows the top 5 marker genes for each cluster.
+
+```{r markers, cache=FALSE}
+if(file.exists(file.path(saveDir, paste0("markers/all_markers_", set_res, ".RDS")))){
+  all_markers <- readRDS(file.path(saveDir, paste0("markers/all_markers_", set_res, ".RDS")))
+}else{
+plan(strategy = "multiprocess", workers = 18)
+
+all_markers <- FindAllMarkers(seur, only.pos = T)
+}
+```
+
+```{r save-markers, cache=FALSE}
+dir.create(file.path(saveDir, "markers"))
+
+if(!file.exists(file.path(saveDir, paste0("markers/all_markers_", set_res, ".RDS")))){
+saveDat(all_markers,csv = T, filename = paste0("markers/all_markers_", set_res))
+
+for(n in unique(all_markers$cluster)){
+  temp <- all_markers %>% filter(cluster == n)
+  saveDat(temp, filename = paste0("markers/cluster_", n,"_res_", set_res), csv = TRUE)
+}
+
+}
+```
+
+#### Top Markers
+
+```{r markers-table, cache=FALSE}
+
+top5 <- all_markers %>% group_by(cluster) %>% select(gene, everything()) %>% top_n(n = 5, wt = avg_logFC)
+
+datatable(top5, filter = "bottom", rownames = FALSE)
+
+```
+
+
+#### All markers
+
+```{r, cache=FALSE}
+downloadableDT(all_markers %>% select(cluster, gene, everything()) %>% arrange(cluster, -avg_logFC), filter = "bottom", rownames = FALSE)
+```
+
+
+Automated Cell Type Classification
+==================================
+
+
+
+```{r avg-exprs, message=FALSE, warning=FALSE, error=FALSE}
+exprs <- AverageExpression(seur, assays = "RNA", slot = "counts")
+cell_type_markers <- read.csv(here("data/combined_markers.csv"), header = TRUE, stringsAsFactors = FALSE)[,1:2]
+cell_type_markers <- cell_type_markers %>% filter(Gene %in% rownames(seur) & CellType != "CellCycle")
+cell_type_markers_list <- lapply(unique(cell_type_markers$CellType), function(x){cell_type_markers$Gene[cell_type_markers$CellType == x]})
+names(cell_type_markers_list) <- unique(cell_type_markers$CellType)
+
+```
+
+
+
+```{r gsva-cellID, results="hide"}
+cluster_gsva <- gsva(as.matrix(exprs$RNA), cell_type_markers_list)
+cluster_gsva_id <- apply(cluster_gsva, 2, function(x){rownames(cluster_gsva)[which.max(x)]})
+
+```
+
+```{r gsva-ID_seur, results="hide", cache=FALSE}
+seur@meta.data %>% mutate(cell_type_gsva = cluster_gsva_id[eval(parse(text=paste0("RNA_snn_res.",set_res)))]) %>% select(cell_type_gsva) -> cell_type_gsva
+seur$cell_type_gsva <- cell_type_gsva$cell_type_gsva
+```
+
+
+## Table - cell numbers
+
+```{r cell-type-table}
+
+kable(table(seur$cell_type_gsva, seur$orig.ident))
+
+```
+
+
+## Plot cell types {.tabset}
+
+
+### UMAP labeled by automated cell type
+
+
+```{r plot-gsva-id}
+
+DimPlot(seur,
+        reduction = "umap",
+        group.by = "cell_type_gsva",
+        label = T,
+        label.size = 4) + NoLegend()
+
+```
+
+### UMAP labeled by cluster
+
+```{r plot-gsva-id-cluster}
+DimPlot(seur, 
+        reduction = "umap",
+        group.by = paste0("RNA_snn_res.", set_res),
+        label = T, label.size = 4) + NoLegend()
+
+
+```
+
+
+
+
+## Bar Plot
+
+```{r plot-cell_props}
+cell_props <- as_tibble(prop.table(table(seur$cell_type_gsva, seur$orig.ident), margin = 2), .name_repair = "universal")
+cell_props <- cell_props %>% rename("Cell Type" = ...1, "orig.ident" = ...2, "Pct" = n)
+melt_cell_props <- reshape2::melt(cell_props) %>% arrange(-value)
+melt_cell_props$`Cell Type` <- factor(melt_cell_props$`Cell Type`, levels = unique(melt_cell_props$`Cell Type`))
+
+
+p2 <- ggplot(melt_cell_props, aes(x=orig.ident, y=value, fill=`Cell Type`)) +
+  geom_bar(stat="identity", position = "fill", color = "white") +
+  labs(title="", y="Proportion", x="", fill="Cell Type")
+p2 + theme_minimal()
+
+```
+
+
+## Table - proportions
+
+```{r table-auto_cell_props}
+cell_props %>% tidyr::spread(orig.ident, Pct) %>% kable() %>% kable_styling(full_width = F, position = "left")
+```
+
+
+
+
+# Marker Gene Violin Plots {.tabset}
+
+```{r vln-assay, cache=FALSE}
+DefaultAssay(seur) <- "RNA"
+```
+
+```{r vln_markers}
+
+vln_markers <- readxl::read_excel(here("data/vln_plot_markers.xlsx"))
+
+vln_markers_list <- lapply(unique(vln_markers$Name), function(x){
+  features <- vln_markers %>% filter(Name == x)
+})
+
+names(vln_markers_list) <- unique(vln_markers$Name)
+
+```
+
+```{r vln-plots, results = "hide"}
+src_list <- lapply(names(vln_markers_list), function(celltype) {
+    src <- c("## {{celltype}} {.unnumbered}",
+             "```{r vln-{{celltype}}, fig.width=10, fig.height=4}",
+             "VlnPlot(seur, pt.size = 0, ncol = 2,",
+                  "features = vln_markers_list[['{{celltype}}']]$Gene)",
+             "```",
+             "")
+    knit_expand(text = src)
+})
+
+out <- knit_child(text = unlist(src_list), options = list(cache = FALSE,fig.height=6))
+
+```
+
+`r out`
+
+
+
+
+Manual Cell Type Assignment
+===========================
+
+```{r man-cell-type, cache=FALSE}
+
+Idents(seur) <- paste0("RNA_snn_res.", set_res)
+
+cluster_id <- read_csv(here("data/cluster_IDs/in_vivo/day_14_2_wk_2.csv")) %>% mutate(Cluster = as.factor(Cluster))
+
+temp_meta <- tibble(cell_name = rownames(seur@meta.data),
+                    ident = Idents(seur))
+
+temp_meta <- left_join(temp_meta, cluster_id, by = c("ident"="Cluster")) 
+
+collapse <- c("S-Shaped Body", "Comma-Shaped Body", "Renal Vessicle", "Cap Mesenchyme")
+
+temp_meta <- temp_meta %>% mutate(cell_type_simple = ifelse(cell_type_manual %in% collapse, "Nephron Progenitor", cell_type_manual)) %>% 
+  select(cell_name, cell_type_manual, cell_type_simple) %>% column_to_rownames("cell_name")
+
+seur <- AddMetaData(seur, temp_meta)
+
+Idents(seur) <- "cell_type_manual"
+
+
+
+
+
+```
+
+
+## Plot cell types {.tabset}
+
+
+### UMAP labeled by manual cell type
+
+
+```{r plot-man-id, cache=FALSE}
+
+DimPlot(seur,
+        reduction = "umap",
+        group.by = "cell_type_manual",
+        label = T,
+        label.size = 4) +NoLegend()
+
+```
+
+### UMAP labeled by simplified cell type
+
+
+```{r plot-man-id-simple, cache=FALSE}
+
+DimPlot(seur,
+        reduction = "umap",
+        group.by = "cell_type_simple",
+        label = T,
+        label.size = 4) +NoLegend()
+
+```
+
+
+
+### UMAP labeled by cluster
+
+```{r plot-man-id-cluster, fig.height=8}
+DimPlot(seur, 
+        reduction = "umap",
+        group.by = paste0("RNA_snn_res.", set_res),
+        label = T, label.size = 4) + NoLegend()
+
+
+```
+
+
+
+
+
+Manual Cell Type Proportions
+----------------------------
+
+### Plot
+
+#### All Cell Types 
+
+```{r plot-cell_props_manual, cache=FALSE}
+
+
+cell_levels <- c("Podocyte", "Proximal Tubule", "Distal Tubule", "Thick Ascending Limb", "Collecting Duct", "Podocyte Precursor", "Early Proximal Tubule", "Nephron Progenitor","Epithelial",
+                 "S-Shaped Body", "Comma-Shaped Body", "Renal Vessicle", "Cap Mesenchyme",
+                 "Endothelial", "Stroma", "Glial", "Cartilage", "Melanocyte", "Muscle", "Neural",
+                 "Pluripotent", "Cell Cycle", "High Ribosomal", "Apoptotic")
+
+cell_levels_collapse <- c("Podocyte", "Proximal Tubule", "Distal Tubule", "Thick Ascending Limb", "Collecting Duct", "Podocyte Precursor", "Nephron Progenitor","Epithelial",
+                          "Endothelial",
+                          "Stroma", "Glial", "Neural", "Melanocyte", "Cartilage", "Muscle", 
+                          "High Ribosomal", "Pluripotent", "Cell Cycle")
+
+colors <- c(gg_color_hue(10), "grey90", "grey80", "grey70", "grey60", "grey50", "grey40", "grey30", "grey20", "grey10")
+names(colors) <- cell_levels_collapse
+
+
+
+cell_props <- as.data.frame(prop.table(table(seur$cell_type_manual, seur$orig.ident), margin = 2))
+cell_props <- cell_props %>% dplyr::rename("Cell Type" = Var1, "orig.ident" = Var2, "Pct" = Freq) %>% arrange(-Pct)
+cell_props$`Cell Type` <- factor(cell_props$`Cell Type`, levels = cell_levels)
+
+p2 <- ggplot(cell_props, aes(x=orig.ident, y=Pct, fill=`Cell Type`)) +
+  geom_bar(stat="identity", position = "fill", color = "white") +
+  labs(title="", y="Proportion", x="", fill="Cell Type") 
+p2 + theme_minimal()
+
+
+
+```
+
+#### Simplified Cell Types 
+
+Removed High Ribosomal and collapsed some cell types to Nephron Progenitor
+
+```{r plot-cell_props_simple, cache=FALSE}
+
+
+
+cell_types <- seur@meta.data %>% filter(cell_type_manual != "High Ribosomal")
+
+cell_props_simple <- as.data.frame(prop.table(table(cell_types$cell_type_simple, cell_types$orig.ident), margin = 2))
+cell_props_simple <- cell_props_simple %>% dplyr::rename("Cell Type" = Var1, "orig.ident" = Var2, "Pct" = Freq) %>% arrange(-Pct)
+cell_props_simple$`Cell Type` <- factor(cell_props_simple$`Cell Type`, levels = cell_levels_collapse)
+
+p3 <- ggplot(cell_props_simple, aes(x=orig.ident, y=Pct, fill=`Cell Type`)) +
+  geom_bar(stat="identity", position = "fill", color = "white") +
+  scale_fill_manual(values = colors, drop = FALSE) +
+  labs(title="", y="Proportion", x="", fill="Cell Type") 
+p3 + theme_minimal()
+
+
+
+```
+
+
+### Table
+
+#### All Cell Types
+
+```{r table-man_cell_props, cache=FALSE}
+cell_props %>% tidyr::spread(orig.ident, Pct) %>% kable() %>% kable_styling(full_width = F, position = "left")
+```
+
+
+#### Simplified Cell Types
+
+```{r table-man_cell_props_simple, cache=FALSE}
+cell_props_simple %>% tidyr::spread(orig.ident, Pct) %>% kable() %>% kable_styling(full_width = F, position = "left")
+```
+
+
+
+
+
+
+
+
+# Recluster Distal Tubule
+
+
+## Collecting Duct Markers
+
+
+```{r, fig.width=12, fig.height=10}
+p1 <- FeaturePlot(seur, features = c("AQP2", "CALB1", "KRT8", "CDH1"), min.cutoff = "q9", combine = F, pt.size = 0.3)
+
+p1 <- lapply(p1, function(x) x+ theme(plot.title = element_text(size = 18),
+                                      legend.text = element_text(size=18),
+                                      axis.title = element_text(size=18)))
+
+
+
+CombinePlots(plots = p1)
+
+# p1
+```
+
+
+## Subset Distal Tubule Cells
+
+```{r distal-tubule-recluster, results="hide"}
+
+
+if(file.exists(file.path(saveDir, "dt_seur.RDS"))){
+  dt_seur <- read_rds(file.path(saveDir, "dt_seur.RDS"))
+}else{
+  dt_seur <- subset(seur, cell_type_manual == "Distal Tubule")
+  
+  dt_seur <- FindVariableFeatures(dt_seur, selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+  dt_seur <- NormalizeData(dt_seur)
+  dt_seur <- ScaleData(dt_seur, vars.to.regress = c("orig.ident", "nCount_RNA", "percent.mito", "S.Score", "G2M.Score"), verbose = TRUE)
+  
+  dt_seur <- RunPCA(dt_seur, npcs = 50, verbose=F)
+  dt_seur <- RunUMAP(dt_seur, dims = 1:50)
+  
+  dt_seur <- FindNeighbors(dt_seur, dims = 1:50)
+  res = seq(0,2,0.1)
+  dt_seur <- FindClusters(dt_seur, resolution = res)
+  dt_seur$RNA_snn_res.1.4 <- factor(dt_seur$RNA_snn_res.1.4, levels = min(as.numeric(levels(dt_seur$RNA_snn_res.1.4))):max(as.numeric(levels(dt_seur$RNA_snn_res.1.4))))
+  dt_seur$RNA_snn_res.2 <- factor(dt_seur$RNA_snn_res.2, levels = min(as.numeric(levels(dt_seur$RNA_snn_res.2))):max(as.numeric(levels(dt_seur$RNA_snn_res.2))))
+  
+  saveDat(dt_seur)
+}
+```
+
+
+## UMAP {.tabset}
+
+### Grouped by sample
+
+```{r, fig.height=6, fig.width=10}
+DimPlot(dt_seur, group.by = "orig.ident")
+```
+
+
+### Grouped by cluster
+
+```{r, fig.height=6, fig.width=8}
+DimPlot(dt_seur, group.by="RNA_snn_res.2", label = T)
+```
+
+### Collecting Duct Markers
+
+```{r, fig.height=10}
+FeaturePlot(dt_seur, features = c("AQP2", "CALB1", "CDH1", "KRT8"), min.cutoff = "q9", ncol = 2)
+
+```
+
+## Marker Gene Violin Plots {.tabset}
+
+### Collecting Duct
+
+```{r, fig.height=6}
+VlnPlot(dt_seur, features = c("AQP2", "CALB1", "CDH1", "KRT8"), group.by = "RNA_snn_res.2", ncol = 2, pt.size = 0.1)
+
+```
+
+
+### Distal Tubule
+
+```{r, fig.height=6}
+VlnPlot(dt_seur, features = vln_markers_list[["Distal Tubule"]]$Gene, group.by = "RNA_snn_res.2", ncol = 2, pt.size = 0.1)
+```
+
+
+## Cluster Markers
+
+```{r}
+Idents(dt_seur) <- "RNA_snn_res.2"
+
+if(file.exists(file.path(saveDir, "dt_markers.RDS"))){
+  dt_markers <- read_rds(file.path(saveDir, "dt_markers.RDS"))
+}else{
+  
+plan(strategy = "multiprocess", workers = 8)
+
+
+dt_markers <- FindAllMarkers(dt_seur)
+
+
+
+cd_markers <- c("AQP1", "AQP2", "AQP3","AQP5", "ATP1A1", "ATP1B1", "CALB1", "NKCC1", "HMX2", "SLC4A1", "CLDN3", "CLDN4", "FOXI1")
+
+top5 <- dt_markers %>% group_by(cluster) %>% top_n(5, avg_logFC)
+
+# clusters <- dt_markers %>% filter(gene %in% c("AQP2", "CALB1")) %>% filter(avg_logFC > 0)
+clusters <- dt_markers %>% filter(gene %in% cd_markers) %>% 
+  filter(avg_logFC > 0)
+# cd_clusters <- unique(clusters$cluster[duplicated(clusters$cluster)])
+cd_clusters <- names(table(clusters$cluster))[table(clusters$cluster) >= 3]
+
+plan(strategy = "sequential")
+saveDat(dt_markers)
+}
+
+```
+
+Chose clusters with increased expression of 3 or more collecting duct marker genes.
+
+`r kable(as.data.frame(cd_markers) %>% rename("Markers"=cd_markers))`
+
+
+```{r, fig.height=12, fig.width=12}
+DoHeatmap(dt_seur, top5$gene, label = F)
+```
+
+
+
+
+## Collecting Duct Clusters
+
+```{r}
+
+# cd_clusters <- c(2)
+
+dt_seur$cell_type_manual <- ifelse(dt_seur$RNA_snn_res.1.4 %in% cd_clusters, "Collecting Duct", "Distal Tubule")
+
+meta <- dt_seur@meta.data %>% select(cell_type_manual) %>% rename(cell_type_manual_2 = cell_type_manual)
+
+seur <- AddMetaData(seur, meta)
+
+seur$cell_type_manual_2 <- ifelse(is.na(seur$cell_type_manual_2), seur$cell_type_manual, seur$cell_type_manual_2)
+
+temp_meta <- tibble(cell_name = rownames(seur@meta.data),
+                    ident = seur$cell_type_manual_2)
+
+collapse <- c("S-Shaped Body", "Comma-Shaped Body", "Renal Vessicle", "Cap Mesenchyme")
+
+temp_meta <- temp_meta %>% mutate(cell_type_simple_2 = ifelse(ident %in% collapse, "Nephron Progenitor", ident)) %>% 
+  select(cell_name, cell_type_simple_2) %>% column_to_rownames("cell_name") #%>% mutate(cell_type_simple_2 = factor(cell_type_simple_2, levels = cell_levels_collapse))
+
+seur <- AddMetaData(seur, temp_meta)
+
+
+seur$cell_type_simple_2 <- factor(seur$cell_type_simple_2, levels = cell_levels_collapse)
+```
+
+
+I chose clusters **`r cd_clusters`** for collecting duct
+
+
+
+
+
+
+
+
+
+
+
+
+Manual Cell Type Proportions w/ Collecting Duct
+-----------------------------------------------
+
+### UMAP {.tabset}
+
+#### All Cell types
+
+```{r}
+DimPlot(seur, group.by = "cell_type_manual_2")
+```
+
+
+#### Simplified Cell Types
+
+```{r}
+DimPlot(seur, group.by = "cell_type_simple_2", cols = colors)
+```
+
+
+#### Collecting Duct Markers
+
+```{r, fig.height=10, fig.width=10}
+FeaturePlot(seur, features=c("AQP2", "CALB1", "CDH1", "KRT8"), ncol = 2)
+```
+
+
+
+
+### Plot
+
+#### All Cell Types 
+
+```{r plot-cell_props_manual2, cache=FALSE}
+
+
+# cell_levels <- c("Podocyte", "Proximal Tubule", "Distal Tubule", "Thick Ascending Limb", "Collecting Duct", "Podocyte Precursor", "Early Proximal Tubule", "Nephron Progenitor","Epithelial",
+#                  "S-Shaped Body", "Comma-Shaped Body", "Renal Vessicle", "Cap Mesenchyme",
+#                  "Endothelial", "Stroma", "Glial", "Cartilage", "Melanocyte", "Muscle", "Neural",
+#                  "Pluripotent", "Cell Cycle", "High Ribosomal", "Apoptotic")
+# 
+# cell_levels_collapse <- c("Podocyte", "Proximal Tubule", "Distal Tubule", "Thick Ascending Limb", "Collecting Duct", "Podocyte Precursor", "Nephron Progenitor","Epithelial",
+#                           "Endothelial",
+#                           "Stroma", "Glial", "Neural", "Melanocyte", "Cartilage", "Muscle", 
+#                           "High Ribosomal", "Pluripotent", "Cell Cycle")
+
+colors <- c(gg_color_hue(10), "grey90", "grey80", "grey70", "grey60", "grey50", "grey40", "grey30", "grey20", "grey10")
+names(colors) <- cell_levels_collapse
+
+
+
+cell_props_2 <- as.data.frame(prop.table(table(seur$cell_type_manual_2, seur$orig.ident), margin = 2))
+cell_props_2 <- cell_props_2 %>% dplyr::rename("Cell Type" = Var1, "orig.ident" = Var2, "Pct" = Freq) %>% arrange(-Pct)
+cell_props_2$`Cell Type` <- factor(cell_props_2$`Cell Type`, levels = cell_levels)
+
+p2 <- ggplot(cell_props_2, aes(x=orig.ident, y=Pct, fill=`Cell Type`)) +
+  geom_bar(stat="identity", position = "fill", color = "white") +
+  labs(title="", y="Proportion", x="", fill="Cell Type") 
+p2 + theme_minimal()
+
+
+
+```
+
+#### Simplified Cell Types 
+
+Removed High Ribosomal and collapsed some cell types to Nephron Progenitor
+
+```{r plot-cell_props_simple2, cache=FALSE}
+
+
+
+cell_types <- seur@meta.data %>% filter(cell_type_manual_2 != "High Ribosomal")
+
+cell_props_simple_2 <- as.data.frame(prop.table(table(as.character(cell_types$cell_type_simple_2), cell_types$orig.ident), margin = 2))
+cell_props_simple_2 <- cell_props_simple_2 %>% dplyr::rename("Cell Type" = Var1, "orig.ident" = Var2, "Pct" = Freq) %>% arrange(-Pct)
+cell_props_simple_2$`Cell Type` <- factor(cell_props_simple_2$`Cell Type`, levels = cell_levels_collapse)
+
+p3 <- ggplot(cell_props_simple_2, aes(x=orig.ident, y=Pct, fill=`Cell Type`)) +
+  geom_bar(stat="identity", position = "fill", color = "white") +
+  scale_fill_manual(values = colors, drop = FALSE) +
+  labs(title="", y="Proportion", x="", fill="Cell Type") 
+p3 + theme_minimal()
+
+
+
+```
+
+
+
+### Table
+
+#### All Cell Types
+
+```{r table-man_cell_props2, cache=FALSE}
+cell_props_2 %>% tidyr::spread(orig.ident, Pct) %>% kable() %>% kable_styling(full_width = F, position = "left")
+```
+
+
+#### Simplified Cell Types
+
+```{r table-man_cell_props_simple2, cache=FALSE}
+cell_props_simple_2 %>% tidyr::spread(orig.ident, Pct) %>% kable() %>% kable_styling(full_width = F, position = "left")
+```
+
+
+
+
+
+
+
+
+
+
+
+```{r save-output, include=FALSE, cache=FALSE}
+
+cell_props %>% write_csv(path=paste0(saveDir,"/", DOCNAME, "_cell_props.csv"))
+cell_props_2 %>% write_csv(path=paste0(saveDir,"/", DOCNAME, "_cell_props_2.csv"))
+write_csv(seur@meta.data, path=paste0(saveDir,"/", DOCNAME, "_meta.csv"))
+
+saveDat(seur, filename = DOCNAME)
+
+```

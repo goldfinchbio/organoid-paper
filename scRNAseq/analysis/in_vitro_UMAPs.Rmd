@@ -1,0 +1,228 @@
+---
+title: "in vitro UMAPs"
+output:
+  html_document:
+    code_folding: hide
+    collapsed: no
+    highlight: haddock
+    keep_md: no
+    theme: cerulean
+    toc: yes
+    toc_float:
+      collapsed: yes
+    toc_depth: 6
+    number_sections: false
+params:
+    date: !r format(Sys.Date(), "%d %B, %Y")
+    client: Goldfinch Bio
+
+---
+
+<!-- Indent the TOC -->
+<script>
+$(document).ready(function() {
+  $items = $('div#TOC li');
+  $items.each(function(idx) {
+    num_ul = $(this).parentsUntil('#TOC').length;
+    $(this).css({'text-indent': num_ul * 10, 'padding-left': 0});
+  });
+
+});
+</script>
+
+<table width=100%>
+<tr>
+<td>
+<h3>Prepared for `r params$client` by:</h3>
+Diamond Age Data Science
+</td>
+<td width=150></td>
+<td width=150 align=right>`r params$date`</td>
+</tr>
+</table>
+
+
+
+
+```{r setup, include=FALSE}
+DOCNAME = "in_vitro_UMAPs"
+knitr::opts_chunk$set(autodep        = TRUE,
+                      cache          = FALSE,
+                      cache.path     = paste0("cache/", DOCNAME, "/"),
+                      fig.path       = paste0("cache/", DOCNAME, "/"),
+                      cache.comments = FALSE,
+                      cache.lazy     = FALSE,
+                      echo           = TRUE,
+                      error          = FALSE,
+                      fig.align      = "center",
+                      fig.width      = 10,
+                      fig.height     = 8,
+                      message        = FALSE,
+                      warning        = FALSE)
+
+#Libraries
+library(Seurat)
+library(parallel)
+library(future)
+library(here)
+library(GSVA)
+library(clustree)
+library(viridis)
+library(knitr)
+library(DT)
+library(kableExtra)
+library(tidyverse)
+
+source(here("R/utilities.R"))
+rename = dplyr::rename
+
+
+#Options
+nCores <- 18
+options(future.globals.maxSize = 16 * 1024^3)
+save = TRUE
+
+
+
+# Directories
+baseDir = here()
+saveDir = file.path(baseDir,"output", DOCNAME)
+if(!dir.exists(saveDir)){
+  dir.create(saveDir)
+}
+
+
+
+```
+
+
+
+```{r}
+conditions <- paste0(c("Day_0", "Day_07", "Day_10", "Day_12", "Day_14", "Day_24", "Day_26", "Day_28"), "_in_vitro_integration")
+
+names(conditions) <- c("D0", "D7", "D10", "D12", "D14", "D24", "D26", "D28")
+
+collapse <- c("S-Shaped Body", "Comma-Shaped Body", "Renal Vessicle", "Cap Mesenchyme", "Podocyte Precursor")
+
+
+
+
+seur_list <- lapply(conditions, function(c){
+    seur <- read_rds(file.path(baseDir,"output",c,paste0(c, ".RDS")))
+    temp_meta <- tibble(cell_name = rownames(seur@meta.data),
+                    cell_type_manual = seur$cell_type_manual)
+
+    temp_meta <- temp_meta %>% mutate(cell_type_manual = ifelse(cell_type_manual == "Neural", "Neuronal", cell_type_manual),
+                                      cell_type_simple = ifelse(cell_type_manual %in% collapse, "Nephron Progenitor", cell_type_manual),
+                                      cell_type_simple = factor(cell_type_simple, levels = cell_levels_collapse)) %>% 
+    select(cell_name, cell_type_simple) %>% column_to_rownames("cell_name")
+    
+    seur <- AddMetaData(seur, temp_meta)
+})
+
+# table(seur_list[[8]]$cell_type_simple)
+
+```
+
+
+
+# ***in vitro*** Plots
+
+
+## combined UMAP panels
+
+```{r}
+
+plots <- lapply(1:length(conditions), function(x){
+                DimPlot(seur_list[[x]], reduction = 'umap',
+                        group.by = 'cell_type_simple', pt.size = 0.01) + 
+                        scale_color_manual(values = colors, drop = FALSE) +
+                        ggtitle("") +
+                        theme_classic(base_size = 16) %+replace% theme(legend.text = element_text(size=8),
+                                      legend.spacing = unit(10, "points"),
+                                      legend.key.height = unit(8, "points"),
+                                      axis.title = element_text(size=14))
+})
+
+plots_no_legend <- lapply(plots, function(x){x + NoLegend()})
+
+
+```
+
+
+```{r, fig.height=4, fig.width=3}
+legend <- cowplot::get_legend(plots[[1]]+ 
+                                theme(legend.text = element_text(size=14),
+                                      legend.spacing = unit(10, "points"),
+                                      legend.key.height = unit(14, "points")))
+
+```
+
+
+```{r, fig.width=12, fig.height=14}
+p1 <- cowplot::plot_grid(plotlist = plots_no_legend, ncol = 2)
+
+cowplot::plot_grid(p1, legend, ncol = 2, rel_widths = c(3,1))
+
+
+```
+
+
+
+
+
+## UMAPs {.tabset}
+
+
+
+```{r cluster-umap, results = "hide"}
+
+src_list <- lapply(1:length(conditions), function(c) {
+    src <- c("### `r names(conditions)[{{c}}]` {.unnumbered}",
+             "```{r labeled-umap-{{c}}}",
+             "DimPlot(seur_list[[{{c}}]], reduction = 'umap',
+                      group.by = 'cell_type_simple',pt.size = 0.3) +
+                      scale_color_manual(values=colors, name='', drop=FALSE) +
+                      theme(legend.text = element_text(size=14),
+                            axis.title = element_text(size=14),
+                            plot.title = element_text(hjust = 0.5))",  
+             "```",
+             "")
+    knit_expand(text = src)
+})
+
+out <- knit_child(text = unlist(src_list), options = list(cache = FALSE))
+```
+
+`r out`
+
+
+
+## TRPC expression  {.tabset}
+
+
+
+```{r feature-umap, results = "hide"}
+
+src_list <- lapply(1:length(conditions), function(c) {
+    src <- c("### `r names(conditions)[{{c}}]` {.unnumbered}",
+             "```{r feature-{{c}}}",
+             "FeaturePlot(seur_list[[{{c}}]], reduction = 'umap',
+                      features = c('TRPC4','TRPC5','TRPC6'),min.cutoff='q9') +
+                      ggtitle(names(conditions)[{{c}}])",  
+             "```",
+             "")
+    knit_expand(text = src)
+})
+
+out <- knit_child(text = unlist(src_list), options = list(cache = FALSE))
+```
+
+`r out`
+
+
+
+
+
+
+
