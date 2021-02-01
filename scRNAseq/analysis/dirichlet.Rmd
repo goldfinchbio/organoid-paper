@@ -1,0 +1,492 @@
+---
+title: "Dirichlet"
+output:
+  html_document:
+    code_folding: hide
+    collapsed: no
+    highlight: haddock
+    keep_md: no
+    theme: cerulean
+    toc: yes
+    toc_float:
+      collapsed: yes
+    toc_depth: 6
+    number_sections: false
+params:
+    date: !r format(Sys.Date(), "%d %B, %Y")
+    client: Goldfinch Bio
+
+---
+
+<!-- Indent the TOC -->
+<script>
+$(document).ready(function() {
+  $items = $('div#TOC li');
+  $items.each(function(idx) {
+    num_ul = $(this).parentsUntil('#TOC').length;
+    $(this).css({'text-indent': num_ul * 10, 'padding-left': 0});
+  });
+
+});
+</script>
+
+<table width=100%>
+<tr>
+<td>
+<h3>Prepared for `r params$client` by:</h3>
+Diamond Age Data Science
+</td>
+<td width=150></td>
+<td width=150 align=right>`r params$date`</td>
+</tr>
+</table>
+
+
+
+
+```{r setup, include=FALSE}
+DOCNAME = "in_vivo_dirichlet"
+knitr::opts_chunk$set(autodep        = TRUE,
+                      cache          = FALSE,
+                      cache.path     = paste0("cache/", DOCNAME, "/"),
+                      fig.path       = paste0("cache/", DOCNAME, "/"),
+                      cache.comments = FALSE,
+                      cache.lazy     = FALSE,
+                      echo           = TRUE,
+                      error          = FALSE,
+                      fig.align      = "center",
+                      fig.width      = 10,
+                      fig.height     = 6,
+                      message        = FALSE,
+                      warning        = FALSE)
+
+#Libraries
+library(here)
+library(viridis)
+library(knitr)
+library(DT)
+library(kableExtra)
+library(parallel)
+library(DirichletReg)
+library(Seurat)
+library(data.table)
+library(RColorBrewer)
+library(tidyverse)
+
+source(here("R/utilities.R"))
+source(here("R/plot.r"))
+source(here("R/colors.r"))
+
+rename = dplyr::rename
+
+
+#Options
+save = TRUE
+
+
+
+# Directories
+baseDir = here()
+saveDir = file.path(baseDir,"output", DOCNAME)
+if(!dir.exists(saveDir)){
+  dir.create(saveDir)
+}
+
+
+
+```
+
+
+
+```{r}
+### from smillie et al
+### https://github.com/cssmillie/ulcerative_colitis
+
+dirichlet_regression = function(counts, covariates, formula){
+
+    # Dirichlet multinomial regression to detect changes in cell frequencies
+    # formula is not quoted, example: counts ~ condition
+    # counts is a [samples x cell types] matrix
+    # covariates holds additional data to use in the regression
+    #
+    # Example:
+    # counts = do.call(cbind, tapply(seur@data.info$orig.ident, seur@ident, table))
+    # covariates = data.frame(condition=gsub('[12].*', '', rownames(counts)))
+    # res = dirichlet_regression(counts, covariates, counts ~ condition)
+    
+    # Calculate regression
+    counts = as.data.frame(counts)
+    counts$counts = DR_data(counts)
+    data = cbind(counts, covariates)
+    fit = DirichReg(counts ~ condition, data)
+    
+    # Get p-values
+    u = summary(fit)
+    pvals = u$coef.mat[grep('Intercept', rownames(u$coef.mat), invert=T), 4]
+    v = names(pvals)
+    pvals = matrix(pvals, ncol=length(u$varnames))
+    rownames(pvals) = gsub('condition', '', v[1:nrow(pvals)])
+    colnames(pvals) = u$varnames
+    fit$pvals = pvals
+    
+    fit
+}
+```
+
+
+
+```{r, fig.height=4, fig.width=6}
+
+if(file.exists(file.path(saveDir, "seur.RDS"))){
+  seur <- read_rds(file.path(saveDir, "seur.RDS"))
+}else{
+  
+  conditions <- c(  "Day_10_2wk_transplant",
+                  "Day_10_4wk_transplant",
+                  "Day_12_2wk_transplant",
+                  "Day_12_4wk_transplant",
+                  "Day_14_2wk_transplant",
+                  "Day_14_4wk_transplant")
+  names(conditions) <- conditions
+  
+  
+  load_seurats <- function(c){
+    temp_seur <- read_rds(here("output", c, paste0(c, ".RDS")))
+    Idents(temp_seur) <- "orig.ident"
+    return(temp_seur)
+  }
+  
+  seur_list <- mclapply(conditions, load_seurats, mc.cores = 6)
+
+
+  seur <- merge(seur_list[[1]], c(seur_list[[2]], seur_list[[3]], seur_list[[4]], seur_list[[5]], seur_list[[6]]))
+  
+  rm(seur_list)
+  gc()
+  
+  saveDat(seur)
+}
+
+  # seur$condition <- str_split(seur$orig.ident, "_transplant", n=2, simplify = T)[,1]
+seur$cell_type_simple <- factor(seur$cell_type_simple, levels = cell_levels_collapse)
+  
+
+table(seur$cell_type_simple)
+
+```
+
+# Condensed Cell Types
+
+## Regression by week
+
+```{r, results="hide"}
+# counts = do.call(cbind, tapply(seur$orig.ident, seur$cell_type_simple_2, table))
+counts = table(seur$orig.ident, seur$cell_type_simple)
+counts <- counts[,colSums(counts) != 0]
+counts <- ifelse(counts ==0, 1, counts)
+covariates = data.frame(condition=str_split(rownames(counts), pattern = "_", n=4, simplify = T)[,3])
+  
+pvals = dirichlet_regression(counts=counts, covariates=covariates, formula=counts ~ condition)$pvals  
+colnames(pvals) <- colnames(counts)
+pct = 100*counts/rowSums(counts)
+prop = counts/rowSums(counts)
+
+p1 = matrix_barplot(prop, group_by=covariates$condition, pvals=pvals, colors = c("lightgrey", "grey40"), ylab = "Proportion", legend.title = "")
+
+
+saveDat(prop, filename = "regress_by_week", csv=T)
+```
+
+```{r fig.height=2.2, fig.width=3.75}
+p1 <- p1 + theme_default() %+replace% theme(axis.text.x = element_text(angle = 90, hjust = 1),
+                                            legend.text = element_text(size=6),
+                                            legend.key.size = unit(6, "pt"),
+                                             axis.text = element_text(size=6),
+                                             strip.text = element_text(size = 6, margin = margin(0.1,0,0.1,0, "cm")),
+                                             axis.title = element_text(size = 6))
+p1
+# cowplot::save_plot(p1,filename = "journal_submission/fig2c.pdf", base_height = 2.11, base_width = 3.52)
+```
+
+### p values
+```{r}
+downloadableDT(pvals, rownames = T)
+
+```
+
+### Proportions
+
+```{r}
+rns <- rownames(prop)
+
+df_prop <- as_tibble(prop) %>% mutate(sample = rns) %>% separate(sample, into = c("condition", "rep"), sep = "_rep")
+
+df_prop <- df_prop %>% pivot_longer(names_to = "Cell Type", cols = c(colnames(prop))) %>% group_by(condition, `Cell Type`) %>% summarise(mean = mean(value), sd = sd(value))
+
+
+downloadableDT(df_prop, rownames = T)
+```
+
+
+## Regression by day
+
+
+```{r, results="hide"}
+# counts = do.call(cbind, tapply(seur$orig.ident, seur$cell_type_simple_2, table))
+counts = table(seur$orig.ident, seur$cell_type_simple_2)
+counts <- counts[,colSums(counts) != 0]
+counts <- ifelse(counts ==0, 1, counts)
+covariates = data.frame(condition= paste0(str_split(rownames(counts), pattern = "_", n=4, simplify = T)[,1], str_split(rownames(counts), pattern = "_", n=4, simplify = T)[,2]))
+  
+pvals = dirichlet_regression(counts=counts, covariates=covariates, formula=counts ~ condition)$pvals  
+colnames(pvals) <- colnames(counts)
+pct = 100*counts/rowSums(counts)
+
+p2 = matrix_barplot(pct, group_by=covariates$condition, pvals=pvals, colors = set.colors, ylab = "Proportion", legend.title = "")
+
+
+downloadableDT(pvals, rownames = T)
+```
+
+```{r}
+p2 + theme_default() %+replace% theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=1.5))
+cowplot::save_plot(p2,filename = paste0(saveDir, "/p2.pdf"))
+```
+
+```{r}
+downloadableDT(pvals, rownames = T)
+
+```
+
+## Regression by day for 2wk
+
+```{r, results="hide"}
+# counts = do.call(cbind, tapply(seur$orig.ident, seur$cell_type_simple_2, table))
+counts = table(seur$orig.ident, seur$cell_type_simple_2)
+counts <- counts[,colSums(counts) != 0]
+counts <- ifelse(counts ==0, 1, counts)
+counts <- counts[grepl("2wk", rownames(counts)),]
+covariates = data.frame(condition= paste0(str_split(rownames(counts), pattern = "_", n=4, simplify = T)[,1], str_split(rownames(counts), pattern = "_", n=4, simplify = T)[,2]))
+  
+pvals = dirichlet_regression(counts=counts, covariates=covariates, formula=counts ~ condition)$pvals  
+colnames(pvals) <- colnames(counts)
+pct = 100*counts/rowSums(counts)
+
+p3 = matrix_barplot(pct, group_by=covariates$condition, pvals=pvals, colors = set.colors)
+
+
+downloadableDT(pvals, rownames = T)
+```
+
+
+```{r}
+p3 + theme_bw(base_size = 14) %+replace% theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust=1.5))
+cowplot::save_plot(p3,filename = paste0(saveDir, "/p3.pdf"))
+```
+
+```{r}
+downloadableDT(pvals, rownames = T)
+
+```
+
+## Regression by day for 4wk
+
+```{r, results="hide"}
+# counts = do.call(cbind, tapply(seur$orig.ident, seur$cell_type_simple_2, table))
+counts = table(seur$orig.ident, seur$cell_type_simple_2)
+counts <- counts[,colSums(counts) != 0]
+counts <- ifelse(counts == 0, 1, counts)
+counts <- counts[grepl("4wk", rownames(counts)),]
+covariates = data.frame(condition= paste0(str_split(rownames(counts), pattern = "_", n=4, simplify = T)[,1], str_split(rownames(counts), pattern = "_", n=4, simplify = T)[,2]))
+  
+pvals = dirichlet_regression(counts=counts, covariates=covariates, formula=counts ~ condition)$pvals  
+colnames(pvals) <- colnames(counts)
+pct = 100*counts/rowSums(counts)
+
+p4 = matrix_barplot(pct, group_by=covariates$condition, pvals=pvals, colors = set.colors)
+
+
+downloadableDT(pvals, rownames = T)
+```
+
+
+```{r}
+p4 + theme_bw(base_size = 14) %+replace% theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust=1.5))
+cowplot::save_plot(p4,filename = paste0(saveDir, "/p4.pdf"))
+```
+
+```{r}
+downloadableDT(pvals, rownames = T)
+
+```
+
+
+# With Off Targets Grouped
+
+
+
+```{r}
+off_targets <- c("Glial", "Melanocyte", "Cartilage", "Muscle")
+
+seur$cell_type_off_targets <- ifelse(as.character(seur$cell_type_simple) %in% off_targets, "Off Target", as.character(seur$cell_type_simple))
+
+cell_levels_off_target <- c(cell_levels_collapse[-which(cell_levels_collapse %in% off_targets)], "Off Target")
+
+seur$cell_type_off_targets <- factor(seur$cell_type_off_targets, levels = cell_levels_off_target)
+
+
+
+```
+
+
+
+## Regression by week
+
+```{r, results="hide"}
+# counts = do.call(cbind, tapply(seur$orig.ident, seur$cell_type_simple_2, table))
+counts = table(seur$orig.ident, seur$cell_type_off_targets)
+counts <- counts[,colSums(counts) != 0]
+counts <- ifelse(counts ==0, 1, counts)
+covariates = data.frame(condition=str_split(rownames(counts), pattern = "_", n=4, simplify = T)[,3])
+
+
+pvals = dirichlet_regression(counts=counts, covariates=covariates, formula=counts ~ condition)$pvals  
+colnames(pvals) <- colnames(counts)
+pct = 100*counts/rowSums(counts)
+prop = counts/rowSums(counts)
+
+p5 = matrix_barplot(prop, group_by=covariates$condition, pvals=pvals, colors = c("lightgrey", "grey40"), ylab = "Proportion", legend.title = "", asterix.size = 3)
+
+downloadableDT(pvals, rownames = T)
+
+saveDat(prop, filename = "collapse_off_target_regress_by_week", csv=T)
+```
+
+
+```{r fig.height=2.5, fig.width=4.25}
+
+p5 <- p5 + theme_default() %+replace% theme(axis.text.x = element_text(angle = 90, hjust = 1),
+                                            legend.text = element_text(size=6),
+                                            legend.key.size = unit(6, "pt"),
+                                            legend.margin=margin(0,0,0,0),
+                                            legend.justification = "left",
+                                            legend.spacing.x = unit(.1, "char"),
+                                            legend.box.margin=margin(-5,-5,-5,-12),
+                                            axis.text = element_text(size=6),
+                                            strip.text = element_text(size = 6, margin = margin(0.1,0,0.1,0, "cm")),
+                                            axis.title = element_text(size = 6))
+p5
+cowplot::save_plot(p5,filename = "journal_submission/fig2c.pdf", base_height = 2.5, base_width = 4.25)
+ggsave("journal_submission/fig2c.png", device="png", width = 4.25, height = 2.5, dpi=600)
+```
+
+### p values
+```{r}
+downloadableDT(pvals, rownames = T)
+
+```
+
+### Proportions
+
+```{r}
+rns <- rownames(prop)
+
+df_prop <- as_tibble(prop) %>% mutate(sample = rns) %>% separate(sample, into = c("condition", "rep"), sep = "_rep")
+
+df_prop <- df_prop %>% pivot_longer(names_to = "Cell Type", cols = c(colnames(prop))) %>% group_by(condition, `Cell Type`) %>% summarise(mean = mean(value), sd = sd(value))
+
+
+downloadableDT(df_prop, rownames = T)
+```
+
+
+## Regression by day
+
+
+```{r, results="hide"}
+# counts = do.call(cbind, tapply(seur$orig.ident, seur$cell_type_simple_2, table))
+counts = table(seur$orig.ident, seur$cell_type_off_targets)
+counts <- counts[,colSums(counts) != 0]
+counts <- ifelse(counts ==0, 1, counts)
+covariates = data.frame(condition= paste0(str_split(rownames(counts), pattern = "_", n=4, simplify = T)[,1], str_split(rownames(counts), pattern = "_", n=4, simplify = T)[,2]))
+  
+pvals = dirichlet_regression(counts=counts, covariates=covariates, formula=counts ~ condition)$pvals  
+colnames(pvals) <- colnames(counts)
+pct = 100*counts/rowSums(counts)
+
+p6 = matrix_barplot(pct, group_by=covariates$condition, pvals=pvals, colors = set.colors)
+
+```
+
+```{r}
+p6 + theme_bw(base_size = 14) %+replace% theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust=1.5))
+cowplot::save_plot(p2,filename = paste0(saveDir, "/p2.pdf"))
+
+downloadableDT(pvals, rownames = T)
+```
+
+```{r}
+downloadableDT(pvals, rownames = T)
+
+```
+
+## Regression by day for 2wk
+
+```{r, results="hide"}
+# counts = do.call(cbind, tapply(seur$orig.ident, seur$cell_type_simple_2, table))
+counts = table(seur$orig.ident, seur$cell_type_off_targets)
+counts <- counts[,colSums(counts) != 0]
+counts <- ifelse(counts ==0, 1, counts)
+counts <- counts[grepl("2wk", rownames(counts)),]
+covariates = data.frame(condition= paste0(str_split(rownames(counts), pattern = "_", n=4, simplify = T)[,1], str_split(rownames(counts), pattern = "_", n=4, simplify = T)[,2]))
+  
+pvals = dirichlet_regression(counts=counts, covariates=covariates, formula=counts ~ condition)$pvals  
+colnames(pvals) <- colnames(counts)
+pct = 100*counts/rowSums(counts)
+
+p7 = matrix_barplot(pct, group_by=covariates$condition, pvals=pvals, colors = set.colors)
+
+downloadableDT(pvals, rownames = T)
+```
+
+
+```{r}
+p7 + theme_bw(base_size = 14) %+replace% theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust=1.5))
+cowplot::save_plot(p3,filename = paste0(saveDir, "/p3.pdf"))
+```
+
+```{r}
+downloadableDT(pvals, rownames = T)
+
+```
+
+## Regression by day for 4wk
+
+```{r, results="hide"}
+# counts = do.call(cbind, tapply(seur$orig.ident, seur$cell_type_simple_2, table))
+counts = table(seur$orig.ident, seur$cell_type_off_targets)
+counts <- counts[,colSums(counts) != 0]
+counts <- ifelse(counts == 0, 1, counts)
+counts <- counts[grepl("4wk", rownames(counts)),]
+covariates = data.frame(condition= paste0(str_split(rownames(counts), pattern = "_", n=4, simplify = T)[,1], str_split(rownames(counts), pattern = "_", n=4, simplify = T)[,2]))
+  
+pvals = dirichlet_regression(counts=counts, covariates=covariates, formula=counts ~ condition)$pvals  
+colnames(pvals) <- colnames(counts)
+pct = 100*counts/rowSums(counts)
+
+p8 = matrix_barplot(pct, group_by=covariates$condition, pvals=pvals, colors = set.colors)
+
+downloadableDT(pvals, rownames = T)
+```
+
+
+```{r}
+p8 + theme_bw(base_size = 14) %+replace% theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust=1.5))
+cowplot::save_plot(p4,filename = paste0(saveDir, "/p4.pdf"))
+```
+
+
+```{r}
+downloadableDT(pvals, rownames = T)
+
+```

@@ -1,0 +1,607 @@
+---
+title: "QC Human data"
+output:
+  html_document:
+    code_folding: hide
+    collapsed: no
+    highlight: haddock
+    keep_md: no
+    theme: cerulean
+    toc: yes
+    toc_float:
+      collapsed: yes
+    toc_depth: 6
+    number_sections: false
+params:
+    date: !r format(Sys.Date(), "%d %B, %Y")
+    client: Goldfinch Bio
+
+---
+
+<!-- Indent the TOC -->
+<script>
+$(document).ready(function() {
+  $items = $('div#TOC li');
+  $items.each(function(idx) {
+    num_ul = $(this).parentsUntil('#TOC').length;
+    $(this).css({'text-indent': num_ul * 10, 'padding-left': 0});
+  });
+
+});
+</script>
+
+<table width=100%>
+<tr>
+<td>
+<h3>Prepared for `r params$client` by:</h3>
+Diamond Age Data Science
+</td>
+<td width=150></td>
+<td width=150 align=right>`r params$date`</td>
+</tr>
+</table>
+
+
+
+
+```{r setup, include=FALSE}
+DOCNAME = "human_qc"
+knitr::opts_chunk$set(autodep        = TRUE,
+                      cache          = TRUE,
+                      cache.path     = paste0("cache/", DOCNAME, "/"),
+                      fig.path       = paste0("cache/", DOCNAME, "/"),
+                      cache.comments = FALSE,
+                      cache.lazy     = FALSE,
+                      echo           = TRUE,
+                      error          = FALSE,
+                      fig.align      = "center",
+                      fig.width      = 10,
+                      fig.height     = 8,
+                      message        = FALSE,
+                      warning        = FALSE)
+
+#Libraries
+library(Seurat)
+library(parallel)
+library(future)
+library(here)
+library(GSVA)
+library(clustree)
+library(viridis)
+library(knitr)
+library(DT)
+library(kableExtra)
+library(tidyverse)
+library(monocle3)
+
+source(here("R/utilities.R"))
+
+#Options
+nCores <- 18
+options(future.globals.maxSize = 8 * 1024^3)
+save = TRUE
+
+
+
+# Functions
+
+
+
+# Directories
+baseDir = here()
+saveDir = file.path(baseDir,"output", DOCNAME)
+if(!dir.exists(saveDir)){
+  dir.create(saveDir)
+}
+
+
+
+```
+
+
+
+
+Load counts
+-----------
+
+```{r process-counts}
+
+
+# data_sets <- list.files(here("data/human"))
+# data_sets <- data_sets[!grepl(".xlsx", data_sets)]
+
+names <- c("Adult_Kidney_GSE114156", "Fetal_Kidney_115days", "Fetal_Kidney_110days", "Fetal_Kidney_105days", "Adult_Kidney_Nehprectomy")
+
+Adult_Kidney_GSE114156 <- read_tsv(here("data/human/GSM2935201_FetalKidney_Run1751_105days.txt")) %>% column_to_rownames(var = "GENE")
+Adult_Kidney_Nehprectomy <- read_csv(here("data/human/SingleCell_Tumor_nephrectomy_Raw_datamatrix.csv")) %>% filter(!duplicated(GENE)) %>% column_to_rownames(var = "GENE")
+Fetal_Kidney_115days <- read_tsv(here("data/human/GSM2935199_FetalKidney_Run1824_115days.txt"))%>% column_to_rownames(var = "GENE")
+Fetal_Kidney_110days <- read_tsv(here("data/human/GSM2935200_FetalKidney_Run1785_110days.txt"))%>% column_to_rownames(var = "GENE")
+Fetal_Kidney_105days <- read_tsv(here("data/human/GSM2935201_FetalKidney_Run1751_105days.txt"))%>% column_to_rownames(var = "GENE")
+
+
+counts <- list(Adult_Kidney_GSE114156, Fetal_Kidney_115days, Fetal_Kidney_110days, Fetal_Kidney_105days, Adult_Kidney_Nehprectomy)
+names(counts) <- names
+
+
+
+# 
+# 
+# 
+# 
+# 
+# counts <- mclapply(1:length(data_sets), function(x){
+#     counts <- read_tsv(here("data/human", data_sets[x]))
+#     colnames(counts) <- paste0(colnames(counts), "-", names(data_sets)[x])
+#     return(counts)
+#     }, mc.cores = nCores)
+
+
+
+seur.list <- mclapply(1:length(counts), function(x) CreateSeuratObject(counts[[x]],min.cells = 10, project = names(counts)[x],
+                                                                       meta.data = data.frame(row.names = colnames(counts[[x]]),
+                                                                                              orig.project = rep(names(counts)[x], ncol(counts[[x]])))))
+
+seur <- merge(seur.list[[1]], y=c(seur.list[[1]], seur.list[[2]], seur.list[[3]], seur.list[[4]], seur.list[[5]]))
+seur <- PercentageFeatureSet(seur, pattern = "MT-", col.name = "percent.mito")
+
+
+```
+
+
+
+Create Seurat Object
+--------------------
+
+
+
+## QC Plots 
+
+### UMI counts vs Number of Genes
+
+
+```{r seur_scatter}
+# FeatureScatter(seur, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", group.by = "species") + ggtitle("All Cells")
+
+ggplot(data = seur@meta.data, aes(x=nCount_RNA, nFeature_RNA))+
+  geom_jitter(aes(color = "red"), size=0.5)+
+  facet_wrap(~orig.ident)
+
+```
+
+
+
+### UMI counts vs Percent Mito
+
+```{r seur_scatter_mito}
+
+ggplot(data = seur@meta.data, aes(x=nCount_RNA, y=percent.mito))+
+  geom_jitter(aes(color= "red"), size=0.5) +
+  facet_wrap(~orig.ident) + NoLegend()
+
+```
+
+
+### Violin Plots
+QC violin plots grouped by orig ident
+
+```{r qc_violin, fig.height=4}
+VlnPlot(seur, features = c("nFeature_RNA", "nCount_RNA", "percent.mito"), pt.size = 0, group.by = "orig.ident")
+
+```
+
+### QC Box Plots
+
+```{r}
+melt <- reshape2::melt(seur@meta.data %>% select(nFeature_RNA, nCount_RNA, percent.mito, orig.ident), id.vars=c("orig.ident"))
+# melt$orig.ident <- factor(melt$orig.ident)
+
+ggplot(data = melt, aes(x=orig.ident, y=value, fill=orig.ident))+
+  geom_boxplot() +
+  facet_wrap(~variable, scales = "free") +
+  theme(legend.position = "none") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+
+## Filter Cells
+
+
+```{r filter_cells}
+
+seur <- subset(seur, nFeature_RNA > 100 & nCount_RNA > 100 & nCount_RNA < 10000 & percent.mito < 20)
+
+```
+
+### Post-QC Violin Plots
+
+```{r post_qc_vln}
+
+VlnPlot(seur, features = c("nFeature_RNA", "nCount_RNA", "percent.mito"), pt.size = 0, group.by = "orig.ident")
+
+
+
+```
+
+### Post-QC Box Plots
+
+```{r post_qc_box}
+
+seur$orig.ident <- factor(seur$orig.ident)
+
+seur_box_plot(object = seur,
+              features = c("nFeature_RNA", "nCount_RNA", "percent.mito"),
+              group = "orig.ident")
+
+
+```
+
+### Cell Numbers
+
+This graph shows the number of human cells in each orig.ident after filtering
+
+```{r post_qc_numb, fig.height=4, fig.width=4}
+
+plotDF <- seur@meta.data
+# plotDF %>% group_by(orig.ident) %>% summarize(count = n())
+
+ggplot(data = plotDF, aes(x=orig.ident, fill= orig.ident))+
+  geom_bar() +
+  theme(legend.position = "none")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+
+```{r, cache=FALSE}
+if(file.exists(file.path(saveDir, paste0(DOCNAME, ".RDS")))){
+  seur <- read_rds(file.path(saveDir, paste0(DOCNAME, ".RDS")))
+  do_eval <- FALSE
+}else{
+  do_eval <- TRUE
+}
+
+```
+
+
+Integrate
+=========
+
+```{r prep-seurList, eval=do_eval, cache=!do_eval, results="hide"}
+seurList <- SplitObject(seur, split.by = "orig.ident")
+
+prepSeur <- function(x){
+                        temp <- seurList[[x]]
+                        temp <- NormalizeData(temp, verbose = FALSE)
+                        temp <- FindVariableFeatures(temp, selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+}
+
+seurList <- mcmapply(prepSeur, names(seurList), mc.cores = nCores)
+
+```
+
+
+```{r integrate-seurat, eval=do_eval, cache=!do_eval, results="hide"}
+plan(strategy = "multiprocess", workers=8)
+anchors <- FindIntegrationAnchors(seurList, anchor.features = 2000, dims = 1:50, verbose = TRUE)
+plan(strategy = "sequential")
+gc()
+```
+
+
+
+```{r int-seur-2, eval=do_eval, cache=!do_eval, results="hide"}
+
+plan(strategy = "multiprocess", workers=12)
+seur <- IntegrateData(anchors, dims = 1:50, verbose = TRUE)
+plan(strategy = "sequential")
+saveDat(seur, filename = DOCNAME)
+rm(anchors, seurList, tempSeur)
+gc()
+```
+
+
+Normalized and Scale Data
+-------------------------
+
+```{r scale-int, eval=do_eval, cache=!do_eval}
+
+
+plan(strategy = "multiprocess", workers=12)
+seur <- ScaleData(object = seur,
+                  verbose = TRUE)
+
+plan(strategy = "sequential")
+
+
+
+saveDat(seur, filename = DOCNAME)
+```
+
+
+```{r}
+seur <- RunPCA(seur, npcs = 75)
+seur <- RunUMAP(seur, dims = 1:75)
+
+saveDat(seur, filename = DOCNAME)
+```
+
+
+
+
+```{r}
+DimPlot(seur, group.by = "orig.ident")
+```
+
+```{r}
+FeaturePlot(seur, features = c("NPHS1", "NPHS2"))
+```
+
+```{r, eval=do_eval, cache=!do_eval}
+seur <- FindNeighbors(seur, dims = 1:75)
+seur <- FindClusters(seur, resolution = 0.5)
+
+saveDat(seur, filename = DOCNAME)
+```
+
+
+```{r}
+DimPlot(seur, group.by = "integrated_snn_res.0.5", label = T)
+```
+
+
+
+```{r, eval=do_eval, cache=!do_eval}
+seur$cell_type_manual <- ifelse(seur$integrated_snn_res.0.5 == 4, "Podocyte", "other")
+
+saveDat(seur, filename = DOCNAME)
+
+```
+
+
+```{r}
+podos <- subset(seur, integrated_snn_res.0.5 == 4)
+
+Idents(podos) <- "orig.ident"
+
+podos <- ScaleData(podos, assay = "RNA")
+
+exprs <- AverageExpression(podos, assays = "RNA")
+
+saveDat(exprs)
+```
+
+
+
+
+
+```{r post_qc_numb2, fig.height=6, fig.width=4}
+
+plotDF <- podos@meta.data
+# plotDF %>% group_by(replicate) %>% summarize(count = n())
+
+ggplot(data = plotDF, aes(x=orig.ident, fill= orig.ident))+
+  geom_bar() +
+  theme(legend.position = "none") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+cell_num <- plotDF %>% group_by(orig.ident) %>% summarise(count = n())
+cell_num %>% kable() %>% kable_styling()
+
+
+num <- sum(cell_num$count)
+```
+
+
+```{r}
+VlnPlot(seur, features = c("GATA3", "MAL", "CDH1", "AQP2"), assay = "RNA", pt.size = 0.1, ncol=2)
+```
+
+```{r}
+FeaturePlot(seur, features = c("GATA3", "MAL", "CDH1", "AQP2"), min.cutoff = "q9")
+
+
+```
+
+
+Distal Tubule/Collecting Duct in cluster 3
+
+```{r}
+seur$cell_type_manual <- ifelse(seur$integrated_snn_res.0.5 == 3, "Distal Tubule", seur$cell_type_manual)
+table(seur$cell_type_manual)
+
+seur$cell_type_simple_2 <- seur$cell_type_manual
+```
+
+
+## Subset Distal Tubule Cells
+
+```{r distal-tubule-recluster, results="hide"}
+
+
+if(file.exists(file.path(saveDir, "dt_seur.RDS"))){
+  dt_seur <- read_rds(file.path(saveDir, "dt_seur.RDS"))
+}else{
+  DefaultAssay(seur) <- "RNA"
+  dt_seur <- subset(seur, cell_type_manual == "Distal Tubule")
+  
+  seurList <- SplitObject(dt_seur, split.by = "orig.ident")
+  seurList <- mcmapply(prepSeur, names(seurList), mc.cores = 8)
+  
+  k.filter <- min(200, min(sapply(seurList, ncol)))
+  anchors <- FindIntegrationAnchors(seurList, anchor.features = 2000, dims = 1:30, verbose = TRUE, k.filter = k.filter)
+  dt_seur <- IntegrateData(anchors, dims = 1:50, verbose = TRUE)
+  
+  dt_seur <- ScaleData(dt_seur, vars.to.regress = c("orig.ident", "nCount_RNA", "percent.mito", "S.Score", "G2M.Score"), verbose = TRUE)
+  
+  dt_seur <- RunPCA(dt_seur, npcs = 50, verbose=F)
+  dt_seur <- RunUMAP(dt_seur, dims = 1:50)
+  
+  dt_seur <- FindNeighbors(dt_seur, dims = 1:50)
+  res = seq(0,2,0.1)
+  dt_seur <- FindClusters(dt_seur, resolution = res)
+  # dt_seur$RNA_snn_res.3 <- factor(dt_seur$RNA_snn_res.3, levels = min(as.numeric(levels(dt_seur$RNA_snn_res.3))):max(as.numeric(levels(dt_seur$RNA_snn_res.3))))
+  
+  DefaultAssay(dt_seur) <- "RNA"
+  
+  saveDat(dt_seur)
+}
+```
+
+
+## UMAP {.tabset}
+
+### Grouped by sample
+
+```{r, fig.height=6, fig.width=10}
+DimPlot(dt_seur, group.by = "orig.ident")
+```
+
+
+### Grouped by cluster
+
+```{r, fig.height=6, fig.width=8}
+DimPlot(dt_seur, group.by="integrated_snn_res.1.5", label = T)
+```
+
+### Collecting Duct Markers
+
+```{r, fig.height=10}
+FeaturePlot(dt_seur, features = c("AQP2", "CALB1", "CDH1", "KRT8"), min.cutoff = "q9", ncol = 2)
+
+```
+
+## Marker Gene Violin Plots {.tabset}
+
+### Collecting Duct
+
+```{r, fig.height=6}
+VlnPlot(dt_seur, features = c("AQP2", "CALB1", "CDH1", "KRT8"), group.by = "integrated_snn_res.1.5", ncol = 2, pt.size = 0.1)
+
+```
+
+
+### Distal Tubule
+
+```{r, fig.height=6}
+VlnPlot(dt_seur, features = vln_markers_list[["Distal Tubule"]]$Gene, group.by = "integrated_snn_res.1.5", ncol = 2, pt.size = 0.1)
+```
+
+## Cluster Markers
+
+```{r}
+
+
+if(file.exists(file.path(saveDir, "dt_markers.RDS"))){
+  dt_markers <- read_rds(file.path(saveDir, "dt_markers.RDS"))
+}else{
+  
+plan(strategy = "multiprocess", workers = 8)
+
+Idents(dt_seur) <- "integrated_snn_res.1.5"
+dt_markers <- FindAllMarkers(dt_seur)
+saveDat(dt_markers)
+plan(strategy = "sequential")
+}
+
+cd_markers <- c("AQP1", "AQP2", "AQP3","AQP5", "ATP1A1", "ATP1B1", "CALB1", "NKCC1", "HMX2", "SLC4A1", "CLDN3", "CLDN4", "FOXI1")
+
+top5 <- dt_markers %>% group_by(cluster) %>% top_n(5, avg_logFC)
+
+# clusters <- dt_markers %>% filter(gene %in% c("AQP2", "CALB1")) %>% filter(avg_logFC > 0)
+clusters <- dt_markers %>% filter(gene %in% cd_markers) %>% 
+  filter(avg_logFC > 0)
+# cd_clusters <- unique(clusters$cluster[duplicated(clusters$cluster)])
+cd_clusters <- names(table(clusters$cluster))[table(clusters$cluster) >= 3]
+
+
+
+
+
+```
+
+Chose clusters with increased expression of 3 or more collecting duct marker genes.
+
+`r kable(as.data.frame(cd_markers) %>% rename("Markers"=cd_markers))`
+
+
+```{r, fig.height=12, fig.width=12}
+DoHeatmap(dt_seur, top5$gene, label = F)
+```
+
+
+## Collecting Duct Clusters
+
+```{r}
+
+# cd_clusters <- c(1,2,5,13,22)
+
+dt_seur$cell_type_manual <- ifelse(dt_seur$integrated_snn_res.1.5 %in% cd_clusters, "Collecting Duct", "Distal Tubule")
+
+meta <- dt_seur@meta.data %>% select(cell_type_manual) %>% dplyr::rename(cell_type_manual_2 = cell_type_manual)
+
+seur <- AddMetaData(seur, meta)
+
+seur$cell_type_manual_2 <- ifelse(is.na(seur$cell_type_manual_2), seur$cell_type_manual, seur$cell_type_manual_2)
+
+temp_meta <- tibble(cell_name = rownames(seur@meta.data),
+                    ident = seur$cell_type_manual_2)
+
+collapse <- c("S-Shaped Body", "Comma-Shaped Body", "Renal Vessicle", "Cap Mesenchyme")
+
+temp_meta <- temp_meta %>% mutate(cell_type_simple_2 = ifelse(ident %in% collapse, "Nephron Progenitor", ident)) %>% 
+  select(cell_name, cell_type_simple_2) %>% column_to_rownames("cell_name") #%>% mutate(cell_type_simple_2 = factor(cell_type_simple_2, levels = cell_levels_collapse))
+
+seur <- AddMetaData(seur, temp_meta)
+
+
+seur$cell_type_simple_2 <- factor(seur$cell_type_simple_2, levels = cell_levels_collapse)
+```
+
+
+I chose cluster(s) **`r cd_clusters`** for collecting duct
+
+
+
+Manual Cell Type Proportions w/ Collecting Duct
+-----------------------------------------------
+
+### UMAP {.tabset}
+
+#### All Cell types
+
+```{r}
+DimPlot(seur, group.by = "cell_type_manual_2")
+```
+
+
+#### Simplified Cell Types
+
+```{r}
+DimPlot(seur, group.by = "cell_type_simple_2", cols = colors)
+```
+
+
+#### Collecting Duct Markers
+
+```{r, fig.height=10, fig.width=10}
+FeaturePlot(seur, features=c("AQP2", "CALB1", "CDH1", "KRT8"), ncol = 2)
+```
+
+
+
+
+
+```{r}
+saveDat(seur, DOCNAME)
+```
+
+
+
+
+
+
+
+

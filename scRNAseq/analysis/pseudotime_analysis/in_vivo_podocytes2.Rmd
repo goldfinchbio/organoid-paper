@@ -1,0 +1,644 @@
+---
+title: "Pseudotime analysis - in vivo podocytes"
+output:
+  html_document:
+    code_folding: hide
+    collapsed: no
+    highlight: haddock
+    keep_md: no
+    theme: cerulean
+    toc: yes
+    toc_float:
+      collapsed: yes
+    toc_depth: 6
+    number_sections: false
+params:
+    date: !r format(Sys.Date(), "%d %B, %Y")
+    client: Goldfinch Bio
+
+---
+
+<!-- Indent the TOC -->
+<script>
+$(document).ready(function() {
+  $items = $('div#TOC li');
+  $items.each(function(idx) {
+    num_ul = $(this).parentsUntil('#TOC').length;
+    $(this).css({'text-indent': num_ul * 10, 'padding-left': 0});
+  });
+
+});
+</script>
+
+<table width=100%>
+<tr>
+<td>
+<h3>Prepared for `r params$client` by:</h3>
+Diamond Age Data Science
+</td>
+<td width=150></td>
+<td width=150 align=right>`r params$date`</td>
+</tr>
+</table>
+
+
+
+```{r setup, include=FALSE}
+DOCNAME = "in_vivo_podocytes2"
+knitr::opts_chunk$set(autodep        = TRUE,
+                      cache          = FALSE,
+                      cache.path     = paste0("cache/", DOCNAME, "/"),
+                      fig.path       = paste0("cache/", DOCNAME, "/"),
+                      cache.comments = FALSE,
+                      cache.lazy     = FALSE,
+                      echo           = TRUE,
+                      error          = FALSE,
+                      fig.align      = "center",
+                      fig.width      = 10,
+                      fig.height     = 8,
+                      message        = FALSE,
+                      warning        = FALSE)
+
+#Libraries
+library(Seurat)
+library(parallel)
+library(future)
+library(here)
+library(GSVA)
+library(clustree)
+library(viridis)
+library(knitr)
+library(DT)
+library(kableExtra)
+library(tidyverse)
+library(scales)
+library(harmony)
+library(monocle)
+library(slingshot)
+library(multcompView)
+library(broom)
+
+source(here("R/utilities.R"))
+
+#Options
+nCores <- 12
+options(future.globals.maxSize = 8 * 1024^3)
+save = TRUE
+
+
+
+# Functions
+
+
+
+# Directories
+baseDir = here()
+saveDir = file.path(baseDir,"output", DOCNAME)
+if(!dir.exists(saveDir)){
+  dir.create(saveDir)
+}
+
+
+
+```
+
+
+# Trajectory analysis of Podocytes and Nephron progenitors
+
+In this analysis I combined the podocytes and nephron progenitors from all of the in vivo datasets. I also included podocytes from adult and fetal kidney (same data included in the podocyte correlations).
+
+
+
+```{r}
+
+if(file.exists(file.path(saveDir, "seur.RDS"))){
+  seur <- read_rds(file.path(saveDir, "seur.RDS"))
+}else{
+  
+  conditions <- c(  "Day_10_2wk_transplant",
+                  "Day_10_4wk_transplant",
+                  "Day_12_2wk_transplant",
+                  "Day_12_4wk_transplant",
+                  "Day_14_2wk_transplant",
+                  "Day_14_4wk_transplant", 
+                  "human_qc")
+  names(conditions) <- conditions
+  
+  
+  select_podos <- function(c){
+    temp_seur <- read_rds(here("output", c, paste0(c, ".RDS")))
+    temp_seur$cell_type_manual_podo <- ifelse(temp_seur$cell_type_manual == "Podocyte Precursor", "Podocyte", temp_seur$cell_type_manual)
+    temp_seur$cell_rep <- paste0(temp_seur$orig.ident, "_", temp_seur$cell_type_manual_podo)
+    podos <- subset(temp_seur, cell_type_manual %in% c("Podocyte", "Nephron Progenitor"))
+    Idents(podos) <- "orig.ident"
+    return(podos)
+  }
+  
+  seur_list <- mclapply(conditions, select_podos, mc.cores = 8)
+
+
+  seur <- merge(seur_list[[1]], c(seur_list[[2]], seur_list[[3]], seur_list[[4]], seur_list[[5]], seur_list[[6]], seur_list[[7]]))
+  seur <- subset(seur, orig.ident != "BTN-PH" & orig.ident != "BTN-YY")
+  
+  rm(seur_list)
+  gc()
+    
+    
+  plan(strategy="multiprocess", workers = 8)
+  seur <- NormalizeData(seur)
+  seur <- ScaleData(seur, vars.to.regress = c("nCount_RNA", "nFeature_RNA"))
+  seur <- FindVariableFeatures(seur, selection.method = "vst", nfeatures = 2000)
+  seur <- RunPCA(seur, npcs=100)
+  # ElbowPlot(seur, ndims = 100)
+  
+  seur$condition <- ifelse(grepl("_rep", seur$orig.ident), str_split(seur$orig.ident, "_rep", simplify = T)[,1], seur$orig.ident)
+  seur$condition2 <- ifelse(grepl("Adult",seur$condition), "AdultKidney", 
+                                  ifelse(grepl("Fetal", seur$condition), "FetalKidney", seur$condition))
+
+  seur <- RunUMAP(seur, reduction = "pca", dims = 1:100)
+  
+  plan(strategy = "sequential")
+  
+  seur <- FindNeighbors(seur, dims = 1:100)
+  seur <- FindClusters(seur, resolution = c(0.2,0.3))
+  
+  
+  
+  condition_levels <- c("Adult Kidney", "Fetal Kidney", "D10-2wk", "D10-4wk", "D12-2wk", "D12-4wk", "D14-2wk", "D14-4wk")
+  
+  conditionDF <- seur@meta.data %>% mutate(condition2 = gsub("day_", "D", condition2),
+                            condition2 = gsub("_2wk_transplant", "-2wk", condition2),
+                            condition2 = gsub("_4wk_transplant", "-4wk", condition2),
+                            condition2 = gsub("Kidney", " Kidney", condition2),
+                            condition2 = factor(condition2, levels = condition_levels))
+  seur$condition2 <- conditionDF$condition2
+
+  saveDat(seur)
+}
+
+
+
+```
+
+
+## Dimensional Reduction {.tabset}
+
+### Grouped by Sample Type
+
+```{r}
+
+
+DimPlot(seur, group.by = "condition2")
+```
+
+
+
+
+
+### Grouped by Dataset
+
+```{r}
+DimPlot(seur, group.by = "orig.ident")
+```
+
+
+### Grouped by Cell Type
+
+```{r}
+
+
+DimPlot(seur, group.by = "cell_type_manual")
+
+# DimPlot(seur, reduction="harmony", group.by = "cell_type_manual", dims = 1:2)
+```
+
+### Grouped by Cluster
+
+```{r}
+DimPlot(seur, group.by = "RNA_snn_res.0.3")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Monocle 2 
+
+
+### Trajectory {.tabset}
+
+Genes that vary most between clusters
+
+
+```{r, fig.height=6}
+if(file.exists(file.path(saveDir, "podo_cds2.RDS"))){
+  podo_cds2 <- read_rds(file.path(saveDir, "podo_cds2.RDS"))
+}else{
+  
+  
+  clustering_DEG_genes <- differentialGeneTest(podo_cds[expressed_genes,],
+                                               fullModelFormulaStr = "~RNA_snn_res.0.3 + batch",
+                                               reducedModelFormulaStr = "~batch",
+                                               cores = 16)
+  
+  ordering_genes2 <-
+      row.names(clustering_DEG_genes)[order(clustering_DEG_genes$qval)][1:1000]
+  
+  podo_cds2 <-
+      setOrderingFilter(podo_cds,
+          ordering_genes = ordering_genes2)
+  
+  podo_cds2 <-
+      reduceDimension(podo_cds2, method = 'DDRTree', verbose = T)
+  
+  podo_cds2 <-
+      orderCells(podo_cds2, reverse = T)
+  
+  # podo_cds2 <- orderCells(podo_cds2, root_state = 3)
+  
+  # podo_cds2$condition2 <- conditionDF$condition2
+  
+  saveDat(podo_cds2)
+}
+
+
+podo_cds2$cell_type_manual_factor <- factor(podo_cds2$cell_type_manual, levels = cell_levels_collapse)
+table(podo_cds2$cell_type_manual_factor)
+```
+
+
+## Cell Numbers
+
+```{r post_qc_numb2, fig.height=6, fig.width=6}
+
+plotDF <- pData(podo_cds2)
+
+ggplot(data = plotDF, aes(x=orig.ident, fill= orig.ident))+
+  geom_bar() +
+  theme(legend.position = "none") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), )
+
+cell_num <- plotDF %>% group_by(orig.ident) %>% summarise(count = n())
+cell_num %>% kable() %>% kable_styling()
+
+cell_num %>% write_csv(paste0("../cell_numbers/pseudotime_", DOCNAME, ".csv"))
+
+num <- sum(cell_num$count)
+```
+
+After filtering there are **`r num`** total cells
+
+
+
+
+#### Labeled by cell type
+
+```{r}
+p <- plot_cell_trajectory(podo_cds2, color_by = "cell_type_manual_factor", cell_size = 0.5) +
+  scale_fill_manual(values = colors, drop = FALSE, name="") +
+  labs(color="", shape="") +
+  theme_classic(base_size = 16, base_family = "Roboto") %+replace% theme(legend.position="top",
+                                                                         legend.text = element_text(size=16),
+                                                                         axis.title = element_text(size=14),
+                                                                         axis.text = element_text(size = 14))
+
+p + guides(color = guide_legend(override.aes = list(size = 2)))
+```
+
+#### Labeled by cell state
+
+```{r}
+plot_cell_trajectory(podo_cds2, color_by = "State", cell_size = 0.5)
+```
+
+#### Labeled by Pseudotime
+
+```{r}
+
+plot_cell_trajectory(podo_cds2, color_by = "Pseudotime", cell_size = 0.5) +
+  scale_color_viridis_c(name="") +
+  theme_classic(base_size = 16, base_family = "Roboto") %+replace% theme(legend.position="top",
+                                                                        legend.text = element_text(size=14),
+                                                                        axis.title = element_text(size=14),
+                                                                        axis.text = element_text(size = 14))
+```
+
+
+#### Labeled by Sample Type
+
+
+```{r}
+library(RColorBrewer)
+
+p <- plot_cell_trajectory(podo_cds2, color_by = "condition2", cell_size = 0.5) +
+  scale_color_brewer(palette = "Paired") +
+  labs(color="", shape="") +
+  theme_classic(base_size = 16, base_family = "Roboto") %+replace% theme(legend.position="top",
+                                                                        legend.text = element_text(size=16),
+                                                                        axis.title = element_text(size=14),
+                                                                        axis.text = element_text(size = 14))
+
+p + guides(color = guide_legend(override.aes = list(size = 2)))
+
+``` 
+
+
+
+#### Labeled by Dataset
+
+```{r}
+plot_cell_trajectory(podo_cds2, color_by = "orig.ident", cell_size = 0.5)
+```
+
+
+
+#### Table of cells in each state
+
+```{r}
+
+plotDF <- pData(podo_cds2) %>% group_by(condition2, State) %>% summarise(count = n()) %>% mutate(percent = round(count/sum(count),3)*100) #%>% spread(RNA_snn_res.0.4, percent)
+# plotDF <- plotDF %>% ungroup() %>% mutate(condition2 = gsub("day_", "D", condition2),
+#                                         condition2 = gsub("_2wk", "-2wk", condition2),
+#                                         condition2 = gsub("_4wk", "-4wk", condition2),
+#                                         condition2 = str_split(condition2, "_", 2, simplify = T)[,1])
+
+# condition_levels <- c("AdultKidney", "FetalKidney", "D10-2wk", "D10-4wk", "D12-2wk", "D12-4wk", "D14-2wk", "D14-4wk")
+
+# plotDF <- plotDF %>% ungroup() %>% mutate(condition2 = factor(condition2, levels = condition_levels))
+
+
+ggplot(plotDF, aes(x=condition2, y=percent))+
+  geom_bar(aes(fill=State), stat = "identity", alpha=0.9) +
+  xlab("") +theme_bw() %+replace% theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+```
+
+
+
+
+
+#### Top 100 genes that change with pseudotime
+
+```{r}
+
+if(file.exists(file.path(saveDir, "pt_diff_test_res2.RDS"))){
+  pt_diff_test_res2 <- read_rds(file.path(saveDir, "pt_diff_test_res2.RDS"))
+}else{
+  pt_diff_test_res2 <- differentialGeneTest(podo_cds2, 
+                                        fullModelFormulaStr = "~sm.ns(Pseudotime)",
+                                        cores = 16)
+  saveDat(pt_diff_test_res2)
+}
+
+
+
+
+```
+
+```{r, fig.height=16, cache=TRUE}
+sig_gene_names <- pt_diff_test_res2 %>% filter(vst.variable == TRUE,
+                                              num_cells_expressed > 50,
+                                              !grepl("MT-",gene_short_name),
+                                              !grepl("^RP",gene_short_name)) %>% arrange(qval) %>% pull(gene_short_name)
+
+
+plot_pseudotime_heatmap(podo_cds2[sig_gene_names[1:100],],
+                num_clusters = 7,
+                cores = 16,
+                show_rownames = T)
+```
+
+
+
+#### Top 100 genes that change at the branch point
+
+Analysis for Branch 1
+
+```{r beam2}
+if(file.exists(file.path(saveDir, "BEAM_res2.RDS"))){
+  BEAM_res2 <- read_rds(file.path(saveDir, "BEAM_res2.RDS"))
+}else{
+  expressed_genes <- row.names(subset(fData(podo_cds2),
+    num_cells_expressed >= 100))
+  BEAM_res2 <- BEAM(podo_cds2[expressed_genes,], branch_point = 1, cores = 16)
+  saveDat(BEAM_res2)
+}
+
+
+
+```
+
+```{r BEAM_heatmap2, fig.height=16, cache=TRUE}
+
+BEAM_gene_names <- BEAM_res2 %>% filter(vst.variable == TRUE,
+                                              num_cells_expressed > 50,
+                                              !grepl("MT-",gene_short_name),
+                                              !grepl("^RP",gene_short_name)) %>% arrange(qval) %>% pull(gene_short_name)
+
+
+
+plot_genes_branched_heatmap(podo_cds2[BEAM_gene_names[1:100],],
+                                          branch_point = 1,
+                                          num_clusters = 3,
+                                          cores = 16,
+                                          use_gene_short_name = T,
+                                          show_rownames = T)
+
+
+```
+
+
+### Pseudotime distribution by sample type {.tabset}
+
+#### Density
+
+```{r, fig.width=6, fig.height=12}
+pt_plotDF <- pData(podo_cds2)
+
+# plotDF <- plotDF %>% mutate(condition2 = gsub("day_", "D", condition2),
+#                             condition2 = gsub("_2wk_transplant", "-2wk", condition2),
+#                             condition2 = gsub("_4wk_transplant", "-4wk", condition2),
+#                             condition2 = factor(condition2, levels = condition_levels))
+
+pt_plotDF <- pt_plotDF %>% filter(cell_type_manual_factor == "Podocyte")
+
+ggplot(data = pt_plotDF, aes(x=Pseudotime, color=condition2, fill=condition2)) +
+  geom_density(alpha=0.8, show.legend = FALSE) +
+  facet_wrap(~condition2, ncol = 2) +
+  scale_fill_viridis_d() +
+  scale_color_viridis_d() +theme_bw(base_size = 14)
+
+
+
+
+
+```
+
+#### Boxplot
+
+
+```{r}
+
+base_color = gg_color_hue(1)
+ggplot(data = pt_plotDF, aes(x=condition2,y=Pseudotime,fill=condition2)) +
+  geom_boxplot(alpha = 1, show.legend = FALSE, color="grey20") +
+  scale_fill_manual(values=c("grey30", "grey50", "#fcaaa4", base_color, "#fcaaa4", base_color, "#fcaaa4", base_color, "#fcaaa4", base_color)) +
+  xlab("") +
+  theme_bw(base_size = 16, base_family = "ARIAL") %+replace% theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+
+```
+
+
+#### Pairwise t-test
+
+```{r}
+
+
+pair_test <- pairwise.t.test(pt_plotDF$Pseudotime, pt_plotDF$condition2, p.adjust.method = "bonferroni")
+
+downloadableDT(tidy(pair_test))
+
+saveDat(tidy(pair_test), filename="pseudotime_pariwise_t", csv=T)
+
+```
+
+
+#### Tukey pairwise test
+
+```{r}
+model=lm(pt_plotDF$Pseudotime ~ pt_plotDF$condition2 )
+Anova=aov(model)
+ 
+tukey.test <- TukeyHSD(x=Anova, 'pt_plotDF$condition2', conf.level=0.95)
+ 
+tukey.test
+
+downloadableDT(tidy(tukey.test))
+
+saveDat(tidy(tukey.test), filename="pseudotime_tukey", csv=T)
+
+```
+
+
+
+#### Pseudotime data
+
+
+```{r}
+
+downloadableDT(pt_plotDF %>% select(condition2, cell_type_manual_factor, Pseudotime))
+
+saveDat(plotDF, filename = "podos_pseudotime", csv=T)
+
+
+```
+
+##### 2 wk vs 4 wk t-test
+
+I performed a t-test to compare pseudotime values for 2 wk vs 4 week podocytes. 
+
+
+```{r}
+pt_DF <- pt_plotDF %>% filter(grepl("wk", condition2)) %>% separate(col = condition2, into = c(NA, "week"), remove = F) %>% mutate(week = as.factor(week))
+
+table(pt_DF$condition2)
+
+
+pval = t.test(Pseudotime ~ week, data=pt_DF)$p.value
+
+```
+
+
+The p value for 2 wk vs 4 week pseudotime is: **`r pval`**
+
+
+```{r}
+ggplot(data=pt_DF, aes(x=week, y=Pseudotime, fill=week)) +
+  geom_boxplot() +
+  theme_bw() + theme(legend.position = "none")
+
+```
+
+
+#### Pseudotime plot faceted {.tabset}
+
+
+
+
+```{r, fig.width=8, fig.height=11}
+
+plot_cell_trajectory(podo_cds2, color_by = "condition2", cell_size = 0.2, show_branch_points = F, show_tree = F) +
+  scale_color_brewer(palette = "Paired") +
+  facet_wrap(~condition2, ncol=2) + 
+  theme_classic(base_size=16, base_family = "Arial") %+replace% theme(strip.background  = element_blank(),
+            panel.grid.major = element_line(colour="white"),
+            panel.grid.minor = element_line(colour="white"),
+            panel.background = element_blank(), 
+            legend.position = "none") 
+
+
+``` 
+
+
+  
+
+
+### Pseudotime plots of marker genes
+
+```{r pseudotime-genes, results = "hide"}
+
+pt_genes <- read_csv(here("data/selected_genes_pseudotime.csv"))
+
+
+tiers <- list("Tier 1"=c(1),
+              "Tiers 1 and 2"=c(1,2),
+              "Tiers 1, 2, 3"=c(1,2,3))
+
+pt_genes_list <- lapply(tiers, function(x){return(pt_genes %>% filter(Tier %in% x))})
+
+src_list <- lapply(1:length(pt_genes_list), function(plot_genes) {
+    src <- c("#### `r names(pt_genes_list)[{{plot_genes}}]` {.unnumbered}",
+             "```{r pt_plot-{{plot_genes}}, fig.height=2*length(pt_genes_list[[{{plot_genes}}]]$gene)}",
+             "plot_cds = podo_cds2[pt_genes_list[[{{plot_genes}}]]$gene]",
+             "plot_genes_in_pseudotime(plot_cds, color_by = 'condition2')",
+             "```",
+             "")
+    knit_expand(text = src)
+})
+
+out <- knit_child(text = unlist(src_list), options = list(cache = FALSE))
+
+
+# plot_cds = podo_cds2[pt_genes_list[[1]]$gene]
+# plot_genes_in_pseudotime(plot_cds[1:3,], color_by = 'condition2')
+```
+
+`r out`
+
+
+
+
+
+
+
+
+
+
+

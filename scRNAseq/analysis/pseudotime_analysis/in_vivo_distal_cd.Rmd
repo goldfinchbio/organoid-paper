@@ -1,0 +1,794 @@
+---
+title: "Pseudotime analysis - Distal Tubule and Collecting Duct"
+output:
+  html_document:
+    code_folding: hide
+    collapsed: no
+    highlight: haddock
+    keep_md: no
+    theme: cerulean
+    toc: yes
+    toc_float:
+      collapsed: yes
+    toc_depth: 6
+    number_sections: false
+params:
+    date: !r format(Sys.Date(), "%d %B, %Y")
+    client: Goldfinch Bio
+
+---
+
+<!-- Indent the TOC -->
+<script>
+$(document).ready(function() {
+  $items = $('div#TOC li');
+  $items.each(function(idx) {
+    num_ul = $(this).parentsUntil('#TOC').length;
+    $(this).css({'text-indent': num_ul * 10, 'padding-left': 0});
+  });
+
+});
+</script>
+
+<table width=100%>
+<tr>
+<td>
+<h3>Prepared for `r params$client` by:</h3>
+Diamond Age Data Science
+</td>
+<td width=150></td>
+<td width=150 align=right>`r params$date`</td>
+</tr>
+</table>
+
+
+
+
+```{r setup, include=FALSE}
+DOCNAME = "in_vivo_dt_cd"
+knitr::opts_chunk$set(autodep        = TRUE,
+                      cache          = FALSE,
+                      cache.path     = paste0("cache/", DOCNAME, "/"),
+                      fig.path       = paste0("cache/", DOCNAME, "/"),
+                      cache.comments = FALSE,
+                      cache.lazy     = FALSE,
+                      echo           = TRUE,
+                      error          = FALSE,
+                      fig.align      = "center",
+                      fig.width      = 10,
+                      fig.height     = 8,
+                      message        = FALSE,
+                      warning        = FALSE)
+
+#Libraries
+library(Seurat)
+library(parallel)
+library(future)
+library(here)
+library(GSVA)
+library(clustree)
+library(viridis)
+library(knitr)
+library(DT)
+library(kableExtra)
+library(tidyverse)
+library(scales)
+library(harmony)
+library(monocle)
+library(slingshot)
+
+source(here("R/utilities.R"))
+
+#Options
+nCores <- 12
+options(future.globals.maxSize = 8 * 1024^3)
+save = TRUE
+
+
+
+# Functions
+
+
+
+# Directories
+baseDir = here()
+saveDir = file.path(baseDir,"output", DOCNAME)
+if(!dir.exists(saveDir)){
+  dir.create(saveDir)
+}
+
+
+
+```
+
+
+# Trajectory analysis of Distal Tubule and Collecting Duct
+
+In this analysis I combined the distal tubule and collecting duct cells from all of the in vivo datasets. I also included cells from adult and fetal kidney.
+
+I batch corrected the data using the Harmony package. This allowed for clustering of the adult and kidney cells with the transplants.
+
+```{r}
+
+if(file.exists(file.path(saveDir, "seur.RDS"))){
+  seur <- read_rds(file.path(saveDir, "seur.RDS"))
+}else{
+  
+  conditions <- c(  "Day_10_2wk_transplant",
+                  "Day_10_4wk_transplant",
+                  "Day_12_2wk_transplant",
+                  "Day_12_4wk_transplant",
+                  "Day_14_2wk_transplant",
+                  "Day_14_4wk_transplant", 
+                  "human_qc")
+  names(conditions) <- conditions
+  
+  
+  select_distal_tubule <- function(c){
+    temp_seur <- read_rds(here("output", c, paste0(c, ".RDS")))
+    DefaultAssay(temp_seur) <- "RNA"
+    # temp_seur$cell_type_manual_podo <- ifelse(temp_seur$cell_type_manual == "Podocyte Precursor", "Podocyte", temp_seur$cell_type_manual)
+    # temp_seur$cell_rep <- paste0(temp_seur$orig.ident, "_", temp_seur$cell_type_manual_podo)
+    podos <- subset(temp_seur, cell_type_manual %in% c("Distal Tubule", "Collecting Duct"))
+    Idents(podos) <- "orig.ident"
+    return(podos)
+  }
+  
+  seur_list <- mclapply(conditions, select_distal_tubule, mc.cores = 8)
+
+  
+  ### removed seur_list[[2]] had no DT or CD cells
+  seur <- merge(seur_list[[1]], c(seur_list[[3]], seur_list[[4]], seur_list[[5]], seur_list[[6]], seur_list[[7]]))
+  seur <- subset(seur, orig.ident != "BTN-PH" & orig.ident != "BTN-YY")
+  
+  
+  ########### Harmony integration
+  
+  plan(strategy="multiprocess", workers = 8)
+  seur <- NormalizeData(seur)
+  seur <- ScaleData(seur, vars.to.regress = c("nCount_RNA", "nFeature_RNA"))
+  seur <- FindVariableFeatures(seur, selection.method = "vst", nfeatures = 2000)
+  seur <- RunPCA(seur, npcs=100)
+  # ElbowPlot(seur, ndims = 100)
+  
+  seur$condition <- ifelse(grepl("_rep", seur$orig.ident), str_split(seur$orig.ident, "_rep", simplify = T)[,1], seur$orig.ident)
+  seur$condition2 <- ifelse(grepl("Adult",seur$condition), "AdultKidney",
+                                  ifelse(grepl("Fetal", seur$condition), "FetalKidney", seur$condition))
+  
+  seur <- RunUMAP(seur, reduction = "pca", dims = 1:100)
+  
+  plan(strategy = "sequential")
+  
+  seur <- RunHarmony(seur, group.by.vars = "condition2")
+  seur <- RunUMAP(seur, reduction = "harmony", reduction.name = "umap_harmony", reduction.key = "umap_harmony_", dims = 1:50)
+  seur <- FindNeighbors(seur, dims = 1:50, reduction = "harmony")
+  seur <- FindClusters(seur, resolution = c(0.05,seq(0,1,0.1)))
+  
+  saveDat(seur)
+  
+  
+  
+  
+}
+
+  
+
+condition_levels <- c("AdultKidney", "FetalKidney", "D10-2wk", "D10-4wk", "D12-2wk", "D12-4wk", "D14-2wk", "D14-4wk")
+
+```
+
+
+## Dimensional Reduction {.tabset}
+
+### Grouped by Sample Type
+
+```{r}
+
+
+DimPlot(seur, group.by = "condition2", reduction = "umap_harmony") 
+
+
+```
+
+
+
+
+
+### Grouped by Dataset
+
+```{r}
+DimPlot(seur, group.by = "orig.ident", reduction = "umap_harmony")
+```
+
+
+### Grouped by Cell Type
+
+```{r}
+
+
+# DimPlot(seur, group.by = "cell_type_manual", reduction = "umap")
+DimPlot(seur, group.by = "cell_type_manual", reduction = "umap_harmony")
+# DimPlot(seur, group.by = "cell_type_simple_2", reduction = "tsne_harmony")
+```
+
+### Grouped by Cluster
+
+```{r}
+DimPlot(seur, reduction = "umap_harmony", group.by = "RNA_snn_res.0.9", label = T)
+# DimPlot(seur, reduction = "umap_harmony", group.by = "RNA_snn_res.0.8", label = T)
+```
+
+### Marker Gene Expression
+
+```{r, fig.height=16, fig.width=8}
+FeaturePlot(seur, c("AQP2", "CALB1"), reduction = "umap_harmony", ncol=1)
+```
+
+
+
+
+## Marker Gene Violin Plots {.tabset}
+
+### Collecting Duct
+
+```{r, fig.height=6}
+VlnPlot(seur, features = c("AQP2", "CALB1", "CDH1", "KRT8"), group.by = "RNA_snn_res.0.9", ncol = 2, pt.size = 0.1)
+
+```
+
+
+
+
+## Cluster Markers
+
+```{r}
+
+
+if(file.exists(file.path(saveDir, "markers.RDS"))){
+  markers <- read_rds(file.path(saveDir, "markers.RDS"))
+}else{
+  
+plan(strategy = "multiprocess", workers = 8)
+
+Idents(seur) <- "RNA_snn_res.0.9"
+markers <- FindAllMarkers(seur)
+saveDat(markers)
+plan(strategy = "sequential")
+}
+
+cd_markers <- c("AQP1", "AQP2", "AQP3","AQP5", "ATP1A1", "ATP1B1", "CALB1", "NKCC1", "HMX2", "SLC4A1", "CLDN3", "CLDN4", "FOXI1")
+
+# top5 <- markers %>% group_by(cluster) %>% top_n(5, avg_logFC)
+
+# clusters <- dt_markers %>% filter(gene %in% c("AQP2", "CALB1")) %>% filter(avg_logFC > 0)
+clusters <- markers %>% filter(gene %in% cd_markers) %>% 
+  filter(avg_logFC > 0)
+# cd_clusters <- unique(clusters$cluster[duplicated(clusters$cluster)])
+cd_clusters <- names(table(clusters$cluster))[table(clusters$cluster) >= 3]
+
+# cd_clusters <- c(1,13,3,9, 6)
+
+
+
+```
+
+Chose clusters with increased expression of 3 or more collecting duct marker genes.
+
+
+
+## Collecting Duct Clusters
+
+```{r}
+
+# cd_clusters <- c(1,2,5,13,22)
+
+seur$cell_type_manual <- ifelse(seur$RNA_snn_res.0.9 %in% cd_clusters, "Collecting Duct-like", "Distal Tubule")
+
+meta <- seur@meta.data %>% select(cell_type_manual) %>% dplyr::rename(cell_type_manual_3 = cell_type_manual)
+
+seur <- AddMetaData(seur, meta)
+
+seur$cell_type_manual_3 <- ifelse(is.na(seur$cell_type_manual_3), seur$cell_type_manual, seur$cell_type_manual_3)
+
+temp_meta <- tibble(cell_name = rownames(seur@meta.data),
+                    ident = seur$cell_type_manual_3)
+
+collapse <- c("S-Shaped Body", "Comma-Shaped Body", "Renal Vessicle", "Cap Mesenchyme")
+
+temp_meta <- temp_meta %>% mutate(cell_type_simple_3 = ifelse(ident %in% collapse, "Nephron Progenitor", ident)) %>% 
+  select(cell_name, cell_type_simple_3) %>% column_to_rownames("cell_name") #%>% mutate(cell_type_simple_2 = factor(cell_type_simple_2, levels = cell_levels_collapse))
+
+seur <- AddMetaData(seur, temp_meta)
+
+
+seur$cell_type_simple_3 <- factor(seur$cell_type_simple_3, levels = c("Distal Tubule", "Collecting Duct-like"))
+
+```
+
+
+I chose cluster(s) **`r cd_clusters`** for collecting duct
+
+
+
+
+
+
+Manual Cell Type Proportions w/ Collecting Duct
+-----------------------------------------------
+
+### UMAP {.tabset}
+
+#### Cell types
+
+```{r fig.height=8, fig.width=8}
+cell_colors <- c(colors["Distal Tubule"],"firebrick")
+
+DimPlot(seur, group.by = "cell_type_simple_3", reduction = "umap_harmony") + 
+  scale_color_manual(values=cell_colors) +
+  theme_classic(base_size = 16, base_family = "Roboto") %+replace% theme(legend.position="top",
+                                                                         legend.text = element_text(size=16),
+                                                                         axis.title = element_text(size=14),
+                                                                         axis.text = element_text(size = 14))
+
+
+```
+
+
+
+#### Collecting Duct Markers
+
+```{r, fig.height=6, fig.width=8}
+# FeaturePlot(seur, features=c("AQP2", "CALB1", "CLDN3", "CDH1"), ncol = 2, reduction = "umap_harmony") +
+#   theme_classic(base_size = 18, base_family = "Roboto") %+replace% theme(
+#     legend.text = element_text(size=14)
+#   )
+
+
+plot_list <-
+  lapply(c("AQP2", "CALB1", "CLDN3", "CDH1"), function(f){
+    p <- FeaturePlot(seur, features=f, reduction = "umap_harmony") +
+      theme_classic(base_size = 14, base_family = "Roboto") %+replace% theme(legend.position="top", plot.title = element_text(size=14),
+                                                                         legend.text = element_text(size=14),
+                                                                         axis.title = element_text(size=14),
+                                                                         axis.text = element_text(size = 14)
+    )
+  }
+)
+
+cowplot::plot_grid(plotlist = plot_list, ncol=2)
+
+
+
+```
+
+
+```{r fig.height=4, fig.width=8}
+
+
+DotPlot(seur, features = c("AQP2", "CALB1", "CDH1", "CLDN3"), group.by = "cell_type_simple_3", scale = T, dot.scale = 15) +
+  ylab("") +
+  xlab("") +
+  theme_classic(base_size = 18, base_family = "Roboto") %+replace% theme(
+    legend.text = element_text(size=14),
+    legend.title = element_text(size = 14)
+  )
+
+
+```
+
+
+
+```{r, fig.height=6}
+
+
+lapply(c("AQP2", "CALB1", "CDH1", "CLDN3"), function(gene){
+  p1 <- VlnPlot(seur, features = gene, group.by = "cell_type_simple_3", ncol = 2, pt.size = 0.1, cols = cell_colors) + 
+    theme(axis.title.x = element_blank()) + NoLegend()
+}
+)
+
+
+
+```
+
+
+
+```{r, fig.height=6}
+
+
+lapply(c("AQP2", "CALB1", "CDH1", "CLDN3"), function(gene){
+  p1 <- VlnPlot(seur, features = gene, group.by = "cell_type_simple_3", ncol = 2, pt.size = 0, cols = cell_colors) + 
+    theme(axis.title.x = element_blank()) + NoLegend()
+}
+)
+
+
+
+```
+
+
+
+```{r}
+
+
+
+```
+
+
+
+
+
+```{r}
+
+
+plan(strategy = "multiprocess", workers = 10)
+
+Idents(seur) <- "cell_type_simple_3"
+dt_cd_markers <- FindAllMarkers(seur)
+saveDat(dt_cd_markers, csv=TRUE)
+plan(strategy = "sequential")
+
+
+```
+
+
+```{r}
+top10 <- dt_cd_markers %>% group_by(cluster) %>% top_n(n = 25, wt = avg_logFC)
+DoHeatmap(seur, features = top10$gene, size = 3) + NoLegend()
+```
+
+## Cell Numbers
+
+```{r post_qc_numb2, fig.height=6, fig.width=4}
+
+plotDF <- seur@meta.data
+# plotDF %>% group_by(replicate) %>% summarize(count = n())
+
+ggplot(data = plotDF, aes(x=orig.ident, fill= orig.ident))+
+  geom_bar() +
+  theme(legend.position = "none") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+cell_num <- plotDF %>% group_by(orig.ident) %>% summarise(count = n())
+cell_num %>% kable() %>% kable_styling()
+
+cell_num %>% write_csv(paste0("../cell_numbers/cd_clustering_", DOCNAME, ".csv"))
+
+num <- sum(cell_num$count)
+
+
+```
+
+After filtering there are **`r num`** total cells
+
+
+
+
+
+## Monocle 2
+
+### Trajectory
+
+Genes that vary most between clusters
+
+
+```{r, fig.height=6}
+if(file.exists(file.path(saveDir, "dt_cds2.RDS"))){
+  dt_cds2 <- read_rds(file.path(saveDir, "dt_cds2.RDS"))
+}else{
+  
+  dt_cds2 <- as.CellDataSet(seur, assay = "RNA", reduction = "umap_harmony")
+  
+  dt_cds2 <- detectGenes(dt_cds2, min_expr = 0.1)
+  expressed_genes <- row.names(subset(fData(dt_cds2),
+      num_cells_expressed >= 10))
+  
+  dt_cds2 <- estimateSizeFactors(dt_cds2)
+  dt_cds2 <- estimateDispersions(dt_cds2)
+  
+  
+  dt_cds2$batch <- ifelse(dt_cds2$condition2 %in% c("AdultKidney", "FetalKidney"), 1, 2)
+  
+  clustering_DEG_genes <- differentialGeneTest(dt_cds2[expressed_genes,],
+                                               fullModelFormulaStr = "~RNA_snn_res.0.9 + batch",
+                                               reducedModelFormulaStr = "~batch",
+                                               cores = 12)
+  
+  ordering_genes <-
+      row.names(clustering_DEG_genes)[order(clustering_DEG_genes$qval)][1:1000]
+  
+  dt_cds2 <-
+      setOrderingFilter(dt_cds2,
+          ordering_genes = ordering_genes)
+  
+  dt_cds2 <-
+      reduceDimension(dt_cds2, method = 'DDRTree', verbose = T)
+  
+  dt_cds2 <-
+      orderCells(dt_cds2, num_paths = 1, reverse = T)
+  
+  dt_cds2$sample_name <- NULL
+  saveDat(dt_cds2)
+}
+
+```
+
+
+
+## Cell Numbers
+
+```{r, fig.height=6, fig.width=4}
+
+plotDF <- pData(dt_cds2)
+# plotDF %>% group_by(replicate) %>% summarize(count = n())
+
+ggplot(data = plotDF, aes(x=orig.ident, fill= orig.ident))+
+  geom_bar() +
+  theme(legend.position = "none") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+cell_num <- plotDF %>% group_by(orig.ident) %>% summarise(count = n())
+cell_num %>% kable() %>% kable_styling()
+
+cell_num %>% write_csv(paste0("../cell_numbers/pseudotime_", DOCNAME, ".csv"))
+
+num <- sum(cell_num$count)
+
+
+```
+
+
+```{r}
+dt_cds2$cell_type_simple_3 <- factor(dt_cds2$cell_type_simple_3, levels = c("Distal Tubule", "Collecting Duct-like"))
+
+```
+
+
+#### Labeled by cell type
+
+```{r}
+p <- plot_cell_trajectory(dt_cds2, color_by = "cell_type_simple_3", cell_size = 0.2)  +
+  scale_color_manual(values = cell_colors, name="") +
+  labs(color="", shape="") +
+  theme_classic(base_size = 18, base_family = "Roboto") %+replace% theme(legend.position="top",
+                                                                        legend.text = element_text(size=18),
+                                                                        axis.title = element_text(size=18),
+                                                                        axis.text = element_text(size = 18))
+
+p + guides(color = guide_legend(override.aes = list(size = 2)))
+
+```
+
+#### Labeled by cell state
+
+```{r}
+plot_cell_trajectory(dt_cds2, color_by = "State", cell_size = 0.5)
+```
+
+#### Labeled by Pseudotime
+
+```{r}
+
+plot_cell_trajectory(dt_cds2, color_by = "Pseudotime", cell_size = 0.5) +
+  scale_color_viridis_c(name="") +
+  labs(color="", shape="") +
+  theme_classic(base_size = 18, base_family = "Roboto") %+replace% theme(legend.position="top",
+                                                                        legend.text = element_text(size=14),
+                                                                        axis.title = element_text(size=18),
+                                                                        axis.text = element_text(size = 18))
+
+
+```
+
+
+
+
+
+#### Labeled by Sample Type {.tabset}
+
+```{r}
+conditionDF <- pData(dt_cds2) %>% mutate(condition2 = gsub("day_", "D", condition2),
+                            condition2 = gsub("_2wk_transplant", "-2wk", condition2),
+                            condition2 = gsub("_4wk_transplant", "-4wk", condition2),
+                            # condition2 = gsub("Kidney", " Kidney", condition2),
+                            condition2 = factor(condition2, levels = condition_levels))
+dt_cds2$condition2 <- conditionDF$condition2
+
+table(dt_cds2$condition2, dt_cds2$cell_type_simple_3)
+```
+
+##### Color option 1
+
+```{r}
+
+
+# temp_colors = c("red", "white", "green", "yellow", "orange", "grey", "blue", "lightgrey")
+
+
+p <- plot_cell_trajectory(dt_cds2, color_by = "condition2", cell_size = 0.25) +
+  scale_color_hue(h = c(200, 400), drop=F) +
+  # scale_color_manual(values = temp_colors) +
+  labs(color="", shape="") +
+  theme_classic(base_size = 18, base_family = "Roboto") %+replace% theme(legend.position="top",
+                                                                        legend.text = element_text(size=18),
+                                                                        axis.title = element_text(size=18),
+                                                                        axis.text = element_text(size = 18))
+p + guides(color = guide_legend(override.aes = list(size = 2)))
+
+```
+
+
+##### Color option 2
+
+```{r}
+p <- plot_cell_trajectory(dt_cds2, color_by = "condition2", cell_size = 0.25) +
+  scale_color_viridis_d(name="", option = "inferno", drop=FALSE) +
+  labs(color="", shape="") +
+  theme_classic(base_size = 18, base_family = "Roboto") %+replace% theme(legend.position="top",
+                                                                        legend.text = element_text(size=18),
+                                                                        axis.title = element_text(size=18),
+                                                                        axis.text = element_text(size = 18))
+
+p + guides(color = guide_legend(override.aes = list(size = 2)))
+
+```
+
+
+##### Color option 3
+
+```{r}
+library(RColorBrewer)
+
+p <- plot_cell_trajectory(dt_cds2, color_by = "condition2", cell_size = 0.5) +
+  scale_color_brewer(palette = "Paired", drop=FALSE) +
+  labs(color="", shape="") +
+  theme_classic(base_size = 18, base_family = "Roboto") %+replace% theme(legend.position="top",
+                                                                        legend.text = element_text(size=18),
+                                                                        axis.title = element_text(size=18),
+                                                                        axis.text = element_text(size = 18))
+
+p + guides(color = guide_legend(override.aes = list(size = 2)))
+
+```
+
+
+
+#### Labeled by Dataset
+
+```{r}
+plot_cell_trajectory(dt_cds2, color_by = "orig.ident", cell_size = 0.5)
+```
+
+
+
+#### Table of cells in each state
+
+```{r}
+
+plotDF <- pData(dt_cds2) %>% group_by(condition2, State) %>% summarise(count = n()) %>% mutate(percent = round(count/sum(count),3)*100) #%>% spread(RNA_snn_res.0.4, percent)
+plotDF <- plotDF %>% ungroup() %>% mutate(condition2 = gsub("day_", "D", condition2),
+                                        condition2 = gsub("_2wk", "-2wk", condition2),
+                                        condition2 = gsub("_4wk", "-4wk", condition2),
+                                        condition2 = str_split(condition2, "_", 2, simplify = T)[,1])
+
+
+
+plotDF <- plotDF %>% mutate(condition2 = factor(condition2, levels = condition_levels))
+
+
+ggplot(plotDF, aes(x=condition2, y=percent))+
+  geom_bar(aes(fill=State), stat = "identity") +
+  xlab("") +theme_bw() %+replace% theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+```
+
+
+
+
+
+#### Top 100 genes that change with pseudotime
+
+```{r, fig.height=16}
+
+if(file.exists(file.path(saveDir, "pt_diff_test_res2.RDS"))){
+  pt_diff_test_res2 <- read_rds(file.path(saveDir, "pt_diff_test_res2.RDS"))
+}else{
+  pt_diff_test_res2 <- differentialGeneTest(dt_cds2, 
+                                        fullModelFormulaStr = "~sm.ns(Pseudotime)",
+                                        cores = 16)
+  saveDat(pt_diff_test_res2)
+}
+
+sig_gene_names <- pt_diff_test_res2 %>% filter(vst.variable == TRUE,
+                                              num_cells_expressed > 50,
+                                              !grepl("MT-",gene_short_name),
+                                              !grepl("^RP",gene_short_name)) %>% arrange(qval) %>% pull(gene_short_name)
+
+
+plot_pseudotime_heatmap(dt_cds2[sig_gene_names[1:100],],
+                num_clusters = 7,
+                cores = 16,
+                show_rownames = T)
+
+
+```
+
+
+#### Top 100 genes that change at branch point 1
+
+
+```{r beam2}
+if(file.exists(file.path(saveDir, "BEAM_res2_1.RDS"))){
+  BEAM_res2_1 <- read_rds(file.path(saveDir, "BEAM_res2_1.RDS"))
+}else{
+  expressed_genes <- row.names(subset(fData(dt_cds2),
+    num_cells_expressed >= 100))
+  BEAM_res2_1 <- BEAM(dt_cds2[expressed_genes,], branch_point = 1, cores = 16)
+  saveDat(BEAM_res2_1)
+}
+
+
+
+```
+
+```{r BEAM_heatmap2, fig.height=16}
+
+BEAM_gene_names <- BEAM_res2_1 %>% filter(vst.variable == TRUE,
+                                              num_cells_expressed > 50,
+                                              !grepl("MT-",gene_short_name),
+                                              !grepl("^RP",gene_short_name)) %>% arrange(qval) %>% pull(gene_short_name)
+
+
+
+plot_genes_branched_heatmap(dt_cds2[BEAM_gene_names[1:100],],
+                                          branch_point = 1,
+                                          num_clusters = 3,
+                                          cores = 16,
+                                          use_gene_short_name = T,
+                                          show_rownames = T)
+
+
+```
+
+
+#### Top 100 genes that change at branch point 4
+
+
+```{r beam2_4}
+if(file.exists(file.path(saveDir, "BEAM_res2_4.RDS"))){
+  BEAM_res2_4 <- read_rds(file.path(saveDir, "BEAM_res2_4.RDS"))
+}else{
+  expressed_genes <- row.names(subset(fData(dt_cds2),
+    num_cells_expressed >= 100))
+  BEAM_res2_4 <- BEAM(dt_cds2[expressed_genes,], branch_point = 1, cores = 16)
+  saveDat(BEAM_res2_4)
+}
+
+
+
+```
+
+```{r BEAM_heatmap2_4, fig.height=16}
+
+BEAM_gene_names <- BEAM_res2_4 %>% filter(vst.variable == TRUE,
+                                              num_cells_expressed > 50,
+                                              !grepl("MT-",gene_short_name),
+                                              !grepl("^RP",gene_short_name)) %>% arrange(qval) %>% pull(gene_short_name)
+
+
+
+plot_genes_branched_heatmap(dt_cds2[BEAM_gene_names[1:100],],
+                                          branch_point = 1,
+                                          num_clusters = 3,
+                                          cores = 16,
+                                          use_gene_short_name = T,
+                                          show_rownames = T)
+
+
+```
+
+
+
+
+

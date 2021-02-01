@@ -1,0 +1,647 @@
+---
+title: "in vivo Cell Types"
+output:
+  html_document:
+    code_folding: hide
+    collapsed: no
+    highlight: haddock
+    keep_md: no
+    theme: cerulean
+    toc: yes
+    toc_float:
+      collapsed: yes
+    toc_depth: 6
+    number_sections: false
+params:
+    date: !r format(Sys.Date(), "%d %B, %Y")
+    client: Goldfinch Bio
+
+---
+
+<!-- Indent the TOC -->
+<script>
+$(document).ready(function() {
+  $items = $('div#TOC li');
+  $items.each(function(idx) {
+    num_ul = $(this).parentsUntil('#TOC').length;
+    $(this).css({'text-indent': num_ul * 10, 'padding-left': 0});
+  });
+
+});
+</script>
+
+<table width=100%>
+<tr>
+<td>
+<h3>Prepared for `r params$client` by:</h3>
+Diamond Age Data Science
+</td>
+<td width=150></td>
+<td width=150 align=right>`r params$date`</td>
+</tr>
+</table>
+
+
+
+```{r setup, include=FALSE}
+DOCNAME = "in_vivo_cell_types_12-2019"
+knitr::opts_chunk$set(autodep        = TRUE, 
+                      cache          = FALSE,
+                      cache.path     = paste0("cache/", DOCNAME, "/"),
+                      fig.path       = paste0("cache/", DOCNAME, "/"),
+                      cache.comments = FALSE,
+                      cache.lazy     = FALSE,
+                      echo           = TRUE,
+                      error          = FALSE,
+                      fig.align      = "center",
+                      fig.width      = 10,
+                      fig.height     = 8,
+                      dpi            = 600,
+                      message        = FALSE,
+                      warning        = FALSE)
+
+#Libraries
+library(here)
+library(viridis)
+library(knitr)
+library(DT)
+library(kableExtra)
+library(philentropy)
+library(tidyverse)
+library(Seurat)
+
+
+source(here("R/utilities.R"))
+rename = dplyr::rename
+
+
+#Options
+save = TRUE
+
+
+
+# Directories
+baseDir = here()
+saveDir = file.path(baseDir,"output", DOCNAME)
+if(!dir.exists(saveDir)){
+  dir.create(saveDir, recursive = T)
+}
+
+
+
+```
+
+
+
+
+
+```{r}
+samples <- c("Day_10_2wk", "Day_10_4wk", "Day_12_2wk", "Day_12_4wk", "Day_14_2wk", "Day_14_4wk")
+
+cell_type_list <- lapply(samples, function(s){
+  csv <- list.files(path = here("output", paste0(s, "_transplant")), pattern = "props.csv")
+  df <- read_csv(here("output", paste0(s, "_transplant"),csv))
+  df$Condition <- rep(s, nrow(df))
+  df$Condition <- gsub("_", " ", df$Condition)
+  df <- df %>% rename("Sample"=orig.ident)
+  df$Sample <- str_split(df$Sample, "_", simplify = T)[,5]
+  df$Sample <- gsub("rep", "Rep ", df$Sample)
+  return(df)
+})
+
+names(cell_type_list) <- samples
+
+cell_type_df <- do.call(rbind, cell_type_list)
+cell_type_df <- cell_type_df %>% mutate(Condition = gsub("Day ", "D", Condition),
+                                        Condition = gsub(" 2wk", "-2wk", Condition),
+                                        Condition = gsub(" 4wk", "-4wk", Condition))
+
+condition_levels <- c("D10-2wk", "D10-4wk", "D12-2wk", "D12-4wk", "D14-2wk", "D14-4wk")
+
+cell_type_df <- cell_type_df %>% mutate(Condition = factor(Condition, levels = condition_levels))
+
+
+cell_type_df$`Cell Type` <- gsub("Neural", "Neuronal", cell_type_df$`Cell Type`,fixed = TRUE)
+
+
+```
+
+```{r}
+write_csv(cell_type_df, file.path(saveDir, "cell_type_counts.csv"))
+
+cell_types <- as_tibble(unique(cell_type_df$`Cell Type`)[order(unique(cell_type_df$`Cell Type`))])
+
+write_csv(cell_types, file.path(saveDir, "cell_types.csv"))
+```
+
+
+
+```{r}
+
+cell_type_df$`Cell Type` <- factor(cell_type_df$`Cell Type`, levels = cell_levels)
+
+
+```
+
+
+
+```{r}
+samples <- c("Day_10_2wk", "Day_10_4wk", "Day_12_2wk", "Day_12_4wk", "Day_14_2wk", "Day_14_4wk")
+
+metadata_list <- lapply(samples, function(s){
+  csv <- list.files(path = here("output", paste0(s, "_transplant")), pattern = "_meta.csv")
+  df <- read_csv(here("output", paste0(s, "_transplant"),csv))
+  df <- df %>% select(orig.ident, cell_type_manual, cell_type_manual_2, cell_type_simple, cell_type_simple_2)
+  df$Condition <- rep(s, nrow(df))
+  df$Condition <- gsub("_", " ", df$Condition)
+  df <- df %>% rename("Sample"=orig.ident)
+  df$Sample <- str_split(df$Sample, "_", simplify = T)[,5]
+  df$Sample <- gsub("rep", "Rep ", df$Sample)
+  return(df)
+})
+
+names(metadata_list) <- samples
+
+metadata_df <- do.call(rbind, metadata_list)
+metadata_df <- metadata_df %>% mutate(Condition = gsub("Day ", "D", Condition),
+                                        Condition = gsub(" 2wk", "-2wk", Condition),
+                                        Condition = gsub(" 4wk", "-4wk", Condition))
+
+condition_levels <- c("D10-2wk", "D10-4wk", "D12-2wk", "D12-4wk", "D14-2wk", "D14-4wk")
+
+metadata_df <- metadata_df %>% mutate(Condition = factor(Condition, levels = condition_levels))
+
+metadata_df$cell_type_manual <- gsub("Neural", "Neuronal", metadata_df$cell_type_manual, fixed = TRUE)
+metadata_df$cell_type_simple <- gsub("Neural", "Neuronal", metadata_df$cell_type_simple, fixed = TRUE)
+
+cell_type_counts <- metadata_df %>% group_by(Condition, cell_type_simple, Sample) %>% summarise(count = n())
+# cell_type_counts
+
+cell_type_mean <- cell_type_counts %>% group_by(cell_type_simple, Condition) %>% summarise(mean = mean(count))
+# cell_type_mean
+
+
+cell_type_counts_day_week <- metadata_df %>% separate(Condition, into=c("Day", "Week"), remove = F) %>% group_by(cell_type_simple, Day, Week) %>% summarise(count = n())
+# cell_type_counts_day_week
+
+cell_type_mean_day <- cell_type_counts_day_week %>% group_by(cell_type_simple, Day) %>% summarise(mean = mean(count))
+# cell_type_mean_day
+
+cell_type_mean_week <- cell_type_counts_day_week %>% group_by(cell_type_simple, Week) %>% summarise(mean = mean(count))
+# cell_type_mean_week
+
+
+
+
+write_csv(cell_type_counts, file.path(saveDir, "cell_type_counts.csv"))
+write_csv(cell_type_mean, file.path(saveDir, "cell_type_median.csv"))
+write_csv(cell_type_counts_day_week, file.path(saveDir, "cell_type_counts_day_week.csv"))
+write_csv(cell_type_mean_day, file.path(saveDir, "cell_type_mean_day.csv"))
+write_csv(cell_type_mean_week, file.path(saveDir, "cell_type_mean_week.csv"))
+```
+
+
+
+
+# ***in vivo*** Cell Type Proportions
+
+## All Cell Types
+
+
+```{r, fig.width=10}
+
+# ggplot(data = cell_type_df, aes(x=`Cell Type`, y = Pct))+
+#   geom_bar(stat = "identity") +
+#   facet_wrap(~ Condition)
+
+
+ggplot(cell_type_df %>% group_by(Condition), aes(x=Sample, y=Pct, fill=`Cell Type`)) +
+  geom_bar(stat="identity", position = "fill", color = "white") +
+  labs(title="", y="Proportion", x="", fill="Cell Type") +
+  facet_grid(~ Condition) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  theme_bw(base_size = 14) %+replace% theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+# p2 + theme_minimal()
+
+
+```
+
+
+
+
+
+## Condensed Cell Types
+
+### Figure 1B
+
+```{r, fig.width=11.3, fig.height=9}
+
+collapse <- c("S-Shaped Body", "Comma-Shaped Body", "Renal Vessicle", "Cap Mesenchyme")
+
+plotDF <- cell_type_df %>% mutate(cell_type_character = as.character(`Cell Type`)) %>% 
+  mutate(cell_type_character = ifelse(cell_type_character %in% collapse, "Nephron Progenitor", cell_type_character),
+         `Cell Type` = factor(cell_type_character, levels = cell_levels_collapse),
+         Condition = factor(Condition, levels = c("D10-2wk", "D12-2wk", "D14-2wk", "D10-4wk", "D12-4wk", "D14-4wk")))
+
+plotDF %>% group_by(Condition, `Cell Type`, cell_type_character, Sample) %>% summarize_at(vars(Pct), sum) -> plotDF
+
+
+ggplot(plotDF %>% group_by(Condition), aes(x=Sample, y=Pct, fill=`Cell Type`)) +
+  geom_bar(stat="identity", position = "fill", color = "white") +
+  labs(title="", y="Proportion", x="", fill="Cell Type") +
+  facet_grid(~ Condition) +
+  # scale_fill_manual(values = c(gg_color_hue(6), "grey90", "grey80", "grey70", "grey60", "grey30")) +
+  scale_fill_manual(values = colors, drop = FALSE, name="") +
+  theme_default(base_size = 16) %+replace% theme(axis.text.x = element_text(angle = 90, hjust = 1),
+                                            legend.text = element_text(size=18),
+                                             axis.text = element_text(size=18),
+                                             strip.text = element_text(size = 16, margin = margin(0.1,0,0.1,0, "cm")),
+                                             axis.title = element_text(size = 18))
+
+ggsave("journal_submission/fig2b.png", device = "png", width = 11.3, height = 9, dpi = 600)
+
+
+
+# saveDat(plotDF, filename = "condensed_cell_proportions", csv = TRUE)
+```
+
+
+
+
+## Facet by week
+
+```{r, fig.height=12, fig.width=6}
+collapse <- c("S-Shaped Body", "Comma-Shaped Body", "Renal Vessicle", "Cap Mesenchyme")
+
+
+plotDF <- cell_type_df %>% mutate(cell_type_character = as.character(`Cell Type`)) %>% 
+  mutate(cell_type_character = ifelse(cell_type_character %in% collapse, "Nephron Progenitor", cell_type_character),
+         `Cell Type` = factor(cell_type_character, levels = cell_levels_collapse))
+
+plotDF %>% group_by(Condition, `Cell Type`, cell_type_character, Sample) %>% summarize_at(vars(Pct), sum) -> plotDF
+
+plotDF <- plotDF %>% mutate(Day = str_split(Condition, "-", simplify = T)[,1],
+                  week = str_split(Condition, "-", simplify = T)[,2])
+
+
+
+ggplot(plotDF %>% group_by(Condition), aes(x=Sample, y=Pct, fill=`Cell Type`)) +
+  geom_bar(stat="identity", position = "fill", color = "white") +
+  labs(title="", y="Proportion", x="", fill="Cell Type") +
+  # scale_fill_manual(values = c(gg_color_hue(7), "grey90", "grey70", "grey50", "grey30")) +
+  scale_fill_manual(values = colors, drop = FALSE) +
+  facet_grid(rows = vars(Day), cols = vars(week), switch = "y") +
+  # theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  theme_default() %+replace% theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+in_vivo_cell_types <- plotDF
+
+```
+
+
+
+
+
+# Sample Divergence
+
+
+```{r}
+
+
+similarityDF <- plotDF %>% mutate(sim_cond = paste0(Day, "_", week, "_", Sample)) %>% mutate(sim_cond = gsub(" ", "", sim_cond))
+
+sim_wide <- reshape2::dcast(similarityDF, sim_cond~`Cell Type`, value.var = "Pct", fill = 0)
+sim_wide <- sim_wide %>% column_to_rownames("sim_cond")
+
+sim_dis <- distance(sim_wide, method = "jensen-shannon")
+
+rownames(sim_dis) <- rownames(sim_wide)
+colnames(sim_dis) <- rownames(sim_wide)
+
+sim_dis <- as.data.frame(sim_dis) %>% rownames_to_column("Condition") %>% separate(Condition, into = c("Day_x", "Week_x", "Rep_x"), remove = FALSE)
+sim_dis <- sim_dis %>% select(Condition, Day_x, Week_x, Rep_x, everything())
+
+melt_sim_dis <- reshape2::melt(sim_dis, id.vars=c("Condition", "Day_x","Week_x", "Rep_x"))
+
+melt_sim_dis <- melt_sim_dis %>% separate(variable, into = c("Day_y", "Week_y", "Rep_y"), remove = FALSE) %>%
+  select(Condition, Day_x, Week_x, Rep_x, Day_y, Week_y, Rep_y, everything())
+
+# melt_sim_dis <- melt_sim_dis %>% mutate(comp_x = paste0(Condition, "_", variable),
+#                                           comp_y = paste0(variable, "_", Condition))
+
+
+
+week_levels <- c(
+  paste0("D10-2wk", " vs ", c("D10-2wk", "D12-2wk", "D14-2wk", "D10-4wk", "D12-4wk", "D14-4wk")),
+  paste0("D10-4wk", " vs ", c("D10-2wk", "D12-2wk", "D14-2wk", "D10-4wk", "D12-4wk", "D14-4wk")),
+  paste0("D12-2wk", " vs ", c("D10-2wk", "D12-2wk", "D14-2wk", "D10-4wk", "D12-4wk", "D14-4wk")),
+  paste0("D12-4wk", " vs ", c("D10-2wk", "D12-2wk", "D14-2wk", "D10-4wk", "D12-4wk", "D14-4wk")),
+  paste0("D14-2wk", " vs ", c("D10-2wk", "D12-2wk", "D14-2wk", "D10-4wk", "D12-4wk", "D14-4wk")),
+  paste0("D14-4wk", " vs ", c("D10-2wk", "D12-2wk", "D14-2wk", "D10-4wk", "D12-4wk", "D14-4wk"))
+)
+
+
+day_levels <- c(
+  paste0("D10-2wk", " vs ", c("D10-2wk", "D12-2wk", "D14-2wk", "D10-4wk", "D12-4wk", "D14-4wk")),
+  paste0("D12-2wk", " vs ", c("D10-2wk", "D12-2wk", "D14-2wk", "D10-4wk", "D12-4wk", "D14-4wk")),
+  paste0("D14-2wk", " vs ", c("D10-2wk", "D12-2wk", "D14-2wk", "D10-4wk", "D12-4wk", "D14-4wk")),
+  paste0("D10-4wk", " vs ", c("D10-2wk", "D12-2wk", "D14-2wk", "D10-4wk", "D12-4wk", "D14-4wk")),
+  paste0("D12-4wk", " vs ", c("D10-2wk", "D12-2wk", "D14-2wk", "D10-4wk", "D12-4wk", "D14-4wk")),
+  paste0("D14-4wk", " vs ", c("D10-2wk", "D12-2wk", "D14-2wk", "D10-4wk", "D12-4wk", "D14-4wk"))
+)
+```
+
+
+
+## Distance Between Days (within weeks)
+
+
+
+```{r fig.width=10, fig.height=5}
+### Fig S5B
+
+ymin = 0
+ymax = 0.3
+
+
+plotDF2 <- melt_sim_dis %>% mutate(Comparison = paste0(Day_x,"-", Week_x, " vs ", Day_y, "-", Week_y),
+                                   Comparison_y = paste0(Day_y,"-", Week_y, "_", Day_x, "-", Week_x),
+                                   x_y = paste0(Condition, "_", variable),
+                                   y_x = paste0(variable, "_", Condition),
+                                   Comparison_xy = paste0(x_y, "_",y_x),
+                                   Day_week_x = paste0(Day_x, "_", Week_x),
+                                   Day_week_y = paste0(Day_y, "_", Week_y),
+                                   Comparison = factor(Comparison, levels = day_levels)) %>% filter(Week_x == Week_y,
+                                                                                                    Day_week_x != Day_week_y,
+                                                                                                    Day_x != "D14",
+                                                                                                    Day_y != "D10")
+
+
+scaleFUN <- function(x) sprintf("%.2f", x)
+
+p1 <- ggplot(plotDF2, aes(y=value))+
+  geom_boxplot(aes(x=1), show.legend = F, outlier.shape = NA) +
+  geom_jitter(aes(x=1, color=Comparison), show.legend = F, size = 2, width=0.05) +
+  scale_color_viridis_d(name = "", option = "C") +
+  scale_y_continuous(labels=scaleFUN) +
+  facet_wrap(~"All Samples") +
+  ylab("Jenson-Shannon Divergence\n") +
+  theme_jsd1() %+replace% theme(legend.text = element_text(size=6),
+                                             axis.text = element_text(size=6),
+                                             strip.text = element_text(size = 6, margin = margin(0.1,0,0.1,0, "cm")),
+                                             axis.title = element_text(size = 6))
+
+
+p2 <- ggplot(plotDF2, aes(y=value))+
+  geom_boxplot(aes(x=1), show.legend = F, outlier.shape = NA) +
+  geom_jitter(aes(x=1, color=Comparison), show.legend = T, size = 2, width = 0.05) +
+  scale_color_viridis_d(name = "", option = "C") +
+  facet_wrap(~Week_x) +
+  guides(color = guide_legend(ncol = 1)) +
+  ylab("Jenson-Shannon Divergence") +
+  theme_jsd2() %+replace% theme(legend.text = element_text(size=6),
+                                             axis.text = element_text(size=6),
+                                             strip.text = element_text(size = 6, margin = margin(0.1,0,0.1,0, "cm")),
+                                             axis.title = element_text(size = 6))
+
+
+
+# cowplot::plot_grid(plotlist = list(p1,p2,NULL), ncol = 3, rel_widths = c(2,3,1))
+
+
+
+legend <- cowplot::get_legend(p2)
+
+# p2 <- p2 + Seurat::NoLegend()
+
+p2 <- p2 + theme(legend.position = "none")
+
+# figs5a <- cowplot::plot_grid(plotlist = list(p1,p2,legend, NULL), ncol = 4, rel_widths = c(2,2,1,1))
+# 
+# figs5a
+
+ab <- cowplot::plot_grid(plotlist = list(p1,p2), ncol = 2, rel_widths = c(3,3))
+ab
+figs5b <- cowplot::plot_grid(plotlist = list(ab,legend, NULL), ncol = 3, rel_widths = c(3.05,1,1))
+
+figs5b
+
+p1 <- p1 +
+  ylim(ymin,ymax)
+
+p2 <- p2 +
+  ylim(ymin,ymax)
+
+# cowplot::plot_grid(plotlist = list(p1,p2), ncol = 2, rel_widths = c(0.4,0.8))
+
+
+
+```
+
+
+
+
+
+```{r, fig.width=6}
+
+plotDF2 <- plotDF2 %>% mutate(num_Day_x = as.numeric(str_split(Day_x,pattern = "D", simplify = T)[,2]),
+                                        num_Day_y = as.numeric(str_split(Day_y,pattern = "D", simplify = T)[,2])) %>% filter(num_Day_x < num_Day_y)
+
+
+p1 <- ggplot(plotDF2, aes(y=value))+
+  geom_boxplot(aes(x=1), show.legend = F, outlier.shape = NA) +
+  geom_jitter(aes(x=1, color=Comparison), show.legend = T, size = 2, width=0.05) +
+  scale_color_viridis_d(name = "Comparison", option = "C") +
+  #facet_wrap(~"All Samples") +
+  ylab("Jenson-Shannon Divergence") +
+  theme_jsd1()
+
+
+p1
+
+summaryDays <- plotDF2 %>% group_by(Comparison) %>% summarize(mean = mean(value), median = median(value), sd = sd(value))
+summary <- plotDF2 %>% summarize(mean = mean(value), median = median(value), sd = sd(value))
+
+```
+
+
+```{r}
+summary %>% kable() %>% kable_styling(full_width = F, position = "left")
+summaryDays %>% kable() %>% kable_styling(full_width = F, position = "left")
+```
+
+
+
+
+## Distance Between Weeks (within days)
+
+
+```{r fig.width=8, fig.height=5}
+
+#### Fig S5A
+
+# plotDF3 <- melt_sim_dis %>% mutate(Comparison = paste0(Day_x,"_", Week_x, "-", Day_y, "_", Week_y),
+#                                    x_y = paste0(Condition, "-", variable),
+#                                    y_x = paste0(variable, "-", Condition),
+#                                    Comparison = factor(Comparison, levels = week_levels)) %>% filter(Day_x == Day_y)
+
+# plotDF3 <- melt_sim_dis %>% mutate(Comparison = paste0(Day_x,"_", Week_x, "-", Day_y, "_", Week_y),
+#                                    Comparison_y = paste0(Day_y,"_", Week_y, "-", Day_x, "_", Week_x),
+#                                    x_y = paste0(Condition, "-", variable),
+#                                    y_x = paste0(variable, "-", Condition),
+#                                    Comparison_xy = paste0(x_y, "--",y_x),
+#                                    Day_week_x = paste0(Day_x, "-", Week_x),
+#                                    Day_week_y = paste0(Day_y, "-", Week_y),
+#                                    Comparison = factor(Comparison, levels = day_levels)) %>% filter(Day_x == Day_y,
+#                                                                                                     Week_x != "4wk",
+#                                                                                                     Week_y != "2wk") %>% distinct(Comparison_xy, .keep_all = T)
+
+plotDF3 <- melt_sim_dis %>% mutate(Comparison = paste0(Day_x,"-", Week_x, " vs ", Day_y, "-", Week_y),
+                                   Comparison_y = paste0(Day_y,"-", Week_y, "_", Day_x, "-", Week_x),
+                                   x_y = paste0(Condition, "_", variable),
+                                   y_x = paste0(variable, "_", Condition),
+                                   Comparison_xy = paste0(x_y, "_",y_x),
+                                   Day_week_x = paste0(Day_x, "_", Week_x),
+                                   Day_week_y = paste0(Day_y, "_", Week_y),
+                                   Comparison = factor(Comparison, levels = day_levels)) %>% filter(Day_x == Day_y,
+                                                                                       Week_x != "2wk",
+                                                                                       Week_y != "4wk")
+
+
+scaleFUN <- function(x) sprintf("%.2f", x)
+
+p1 <- ggplot(plotDF3, aes(y=value))+
+  geom_boxplot(aes(x=1), show.legend = F, outlier.shape = NA) +
+  geom_jitter(aes(x=1, color=Comparison), show.legend = F, size = 2, width = 0.05) +
+  scale_color_viridis_d(name = "", option = "C") +
+  scale_y_continuous(labels=scaleFUN) +
+  facet_wrap(~"All Samples") +
+  ylab("Jenson-Shannon Divergence\n") +
+  theme_jsd1() %+replace% theme(legend.text = element_text(size=6),
+                                             axis.text = element_text(size=6),
+                                             strip.text = element_text(size = 6, margin = margin(0.1,0,0.1,0, "cm")),
+                                             axis.title = element_text(size = 6))
+
+
+p2 <- ggplot(plotDF3, aes(y=value))+
+  geom_boxplot(aes(x=1), show.legend = F, outlier.shape = NA) +
+  geom_jitter(aes(x=1, color=Comparison), show.legend = T, size = 2, width = 0.05) +
+  scale_color_viridis_d(name = "", option = "C") +
+  facet_wrap(~Day_x) +
+  guides(color = guide_legend(ncol = 1)) +
+  ylab("Jenson-Shannon Divergence") +
+  theme_jsd2() %+replace% theme(legend.text = element_text(size=6),
+                                             axis.text = element_text(size=6),
+                                             strip.text = element_text(size = 6, margin = margin(0.1,0,0.1,0, "cm")),
+                                             axis.title = element_text(size = 6))
+
+
+# cowplot::plot_grid(plotlist = list(p1,p2), ncol = 2, rel_widths = c(2,4))
+
+legend <- cowplot::get_legend(p2)
+
+# p2 <- p2 + Seurat::NoLegend()
+
+p2 <- p2 + theme(legend.position = "none")
+
+# figs5b <- cowplot::plot_grid(plotlist = list(p1,p2,legend), ncol = 3, rel_widths = c(2,3,1))
+# 
+# figs5b
+
+ab <- cowplot::plot_grid(plotlist = list(p1,p2), ncol = 2, rel_widths = c(1,1.5))
+
+figs5a <- cowplot::plot_grid(plotlist = list(ab,legend), ncol = 2, rel_widths = c(3,1))
+
+figs5a
+
+p1 <- p1 +
+  ylim(ymin,ymax)
+
+p2 <- p2 +
+  ylim(ymin,ymax)
+
+# cowplot::plot_grid(plotlist = list(p1,p2), ncol = 2, rel_widths = c(0.2,0.6))
+
+summaryWeeks <- plotDF3 %>% group_by(Comparison) %>% summarize(mean = mean(value),median = median(value), sd = sd(value))
+summaryWeeks2 <- plotDF3 %>% summarize(mean = mean(value),median = median(value), sd = sd(value))
+```
+
+
+
+
+
+```{r, fig.width=6}
+
+p1 <- ggplot(plotDF3, aes(y=value))+
+  geom_boxplot(aes(x=1), show.legend = F, outlier.shape = NA) +
+  geom_jitter(aes(x=1, color=Comparison), show.legend = T, size = 2, width = 0.05) +
+  scale_color_viridis_d(name = "Comparison", option = "C") +
+  #facet_wrap(~"All Comparisons") +
+  ylab("Jenson-Shannon Divergence") +
+  theme_jsd1()
+
+p1
+```
+
+
+
+
+## Fig S5
+
+```{r fig.width=8, fig.height=10}
+
+cowplot::plot_grid(figs5a, figs5b, ncol=1)
+
+ggsave("journal_submission/figs5.png", device = "png", width = 8, height = 10, dpi = 600)
+
+ggsave("journal_submission/figs5a.png", plot=figs5a, device = "png", width = 8, height = 5, dpi = 600)
+ggsave("journal_submission/figs5b.png", plot=figs5b, device = "png", width = 8, height = 5, dpi = 600)
+
+```
+
+
+
+```{r}
+summaryWeeks2 %>% kable() %>% kable_styling(full_width = F, position = "left")
+
+summaryWeeks %>% kable() %>% kable_styling(full_width = F, position = "left")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Cell type proportions
+
+```{r}
+
+in_vivo_cell_types %>% ungroup() %>%  mutate(Sample = paste(Condition, `Cell Type`, Sample, sep = "-"), Sample = gsub(" ", "_", Sample,fixed = T)) %>% 
+  dplyr::select(Sample, Pct)
+
+day_12 <- tibble(`Cell Type` = unique(c(in_vitro_cell_types$cell_type_character, in_vivo_cell_types$cell_type_character)))
+
+
+in_vivo_cell_types$Sample <- as.factor(in_vivo_cell_types$Sample)
+
+
+```
+
+
+
+
+
+
+
+
+
